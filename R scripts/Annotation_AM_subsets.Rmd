@@ -1,0 +1,677 @@
+---
+title: "Untitled"
+author: "Prashant"
+date: "2024-04-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(reshape2)
+library(dplyr)
+library(readxl)
+library(writexl)
+library(patchwork)
+library(Seurat)
+library(tibble)
+library(DoubletFinder)
+library(tidyr)
+library(RColorBrewer)
+library(msigdbr)
+library(fgsea)
+library(stringr)
+source('/Users/pbajpai/Documents/Rthemes/theme_publication.R')
+source("helper_funs.R")
+```
+
+```{r}
+#rm(list = ls())
+balVer2 <- readRDS("rds_data/balver2.rds")
+balVer2$label.main2 <- factor(balVer2$label.main2, levels = c("AM", "MDM", "Neutrophils", "DC", "Monocyte", "CD4 T cell", "CD8 T cell", "Tgd", "T reg", "B cell", "NK cell", "Epithelial cells"))
+cols <- c("#386cb0","#fdb462","#7fc97f","#ef3b2c","#662506","#a6cee3",
+         "#fb9a99","#6A3D9A","#F6DF07", "#F0027F","#BF5B17", "#666666",
+         "#33A02C", "#FF7F00", "#E78AC3")
+balVer2$hiv_timepoint <- gsub("NEG 0hrs", "HC", balVer2$hiv_timepoint)
+balVer2$hiv_timepoint <- gsub("POS 0hrs", "PLWH", balVer2$hiv_timepoint)
+balVer2$hiv_timepoint <- gsub("NEG 4hrs", "HC+Mtb", balVer2$hiv_timepoint)
+balVer2$hiv_timepoint <- gsub("POS 4hrs", "PLWH+Mtb", balVer2$hiv_timepoint)
+
+balVer2$hiv_timepoint <- factor(balVer2$hiv_timepoint, levels = c("HC", "PLWH", "HC+Mtb", "PLWH+Mtb"))
+```
+
+```{r}
+am <- subset(balVer2, subset = label.main2 == "AM")
+
+am <- FindVariableFeatures(am, verbose = F)
+am <- ScaleData(am, verbose = F)
+am <- NormalizeData(am,  verbose = F)
+am <- RunPCA(am, verbose = F, npcs = 20)
+#ElbowPlot(am)
+am <- RunUMAP(am, dims = 1:15, verbose = F)
+am <- FindNeighbors(am, dims = 1:15)
+am <- FindClusters(am, resolution = 0.05)
+
+DimPlot(am, group.by = "seurat_clusters")
+
+#label am subsets according to psuedotime trajectory
+label.subset <- am@meta.data %>%
+  select(seurat_clusters) %>%
+  mutate(label.subset = ifelse(seurat_clusters == 1, "AM 1", ifelse(seurat_clusters == 2, "AM 2", ifelse(seurat_clusters == 0, "AM 3", ifelse(seurat_clusters == 3, "AM 4", "AM 5"))))) %>%
+  select(label.subset)
+label.subset$label.subset <- factor(label.subset$label.subset, 
+                                    levels = c("AM 1", "AM 2", "AM 3", "AM 4", "AM 5"))
+
+am <- AddMetaData(am, metadata = label.subset)
+Idents(am) <- "label.subset"
+
+p <- DimPlot(am, group.by = "label.subset", cols = cols) + theme(plot.title = element_blank()) 
+
+LabelClusters(p, id = "label.subset", size = 5) 
+
+ggsave("Manuscript_bioxiv/Figures/dump/dimplot_amsubsets.pdf", width = 5, height = 5, units = "in")
+
+p <- DimPlot(am, group.by = "label.subset", cols = cols, split.by = "hiv_timepoint", ncol = 2) + theme(plot.title = element_blank(), legend.position = "none", strip.text = element_text(size = 16)) 
+LabelClusters(p, id = "label.subset", size = 5) 
+
+ggsave("Manuscript_bioxiv/Figures/dump/dimplot_amsubsets_split.pdf", width = 6, height = 6, units = "in")
+```
+# Distrubution of AM subsets
+```{r}
+DimPlot(am, group.by = "label.subset", cols = cols)
+
+FreqTable_labelsubset <- data.frame("SampleID" = am$hiv_timepoint, "label.subset" = am$label.subset) %>% 
+  group_by(SampleID, label.subset) %>% 
+  summarise(n_cells = n()) %>% 
+  ungroup() %>% 
+  spread(label.subset, n_cells, fill = 0)
+
+plotdat <- melt(FreqTable_labelsubset, id.vars = c("SampleID")) %>%
+  group_by(SampleID) %>%
+  mutate(perc = 100 * value/sum(value)) %>%
+  ungroup()
+
+ggplot(plotdat, aes(x = SampleID, y = perc, fill = variable)) + 
+  geom_bar(stat = "identity", position = position_stack(reverse = T)) + 
+  ylab("% of AM") + xlab("") +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme_Publication() + 
+  scale_fill_manual(values = cols, name = "") +
+  theme(axis.text.x = element_text(),
+        axis.text.y = element_text(size = 12),
+        axis.title.y = element_text(size = 14),
+        axis.title.x = element_blank(),
+        legend.text = element_text(size = 11),
+        legend.key.size = unit(0.4, "cm"),
+        legend.position = "bottom") 
+  #guides(fill=guide_legend(nrow=2,byrow=TRUE))
+
+ggsave("Manuscript_bioxiv/Figures/dump/amsubset_freq.png", width = 4, height = 5, units = "in")
+```
+
+
+```{r}
+excelsheets <- excel_sheets("Manuscript_bioxiv/suppliment/AM_subset_marker_genes.xlsx")
+excelsheets <- excelsheets[!excelsheets %in% "AM 5"]
+marker_genes <- sapply(excelsheets, function(x){
+  out <- read_xlsx("Manuscript_bioxiv/suppliment/AM_subset_marker_genes.xlsx", sheet = x)
+}, simplify = F, USE.NAMES = T)
+```
+
+```{r}
+topmarkersPercluster <- lapply(unique(am$label.subset), function(x){
+  message(paste("running subset:", x, sep = ""))
+  cluster_marker <- FindMarkers(am, ident.1 = x, min.pct = 0.1, only.pos = T)
+  cluster_marker <- cluster_marker %>% rownames_to_column("GeneID")
+})
+#names(topmarkersPercluster) <- paste("Cluster",unique(am$label.subset))
+names(topmarkersPercluster) <- unique(am$label.subset)
+topmarkersPercluster <- lapply(topmarkersPercluster, function(x){
+  out <- x[abs(x$avg_log2FC) >= 0.378 & x$p_val_adj <= 0.05,]
+  out <- out[order(out$avg_log2FC, decreasing = T),]
+})
+topmarkersPercluster <- topmarkersPercluster[c("AM 1", "AM 2", "AM 3", "AM 4", "AM 5")]
+topmarkersPercluster <- topmarkersPercluster[c("AM 1", "AM 2", "AM 3", "AM 4")]
+```
+
+
+```{r}
+goi <- lapply(topmarkersPercluster, function(x){
+  out <- x[abs(x$avg_log2FC) >= 0.378 & x$p_val_adj <= 0.05,]
+  out <- out[order(out$avg_log2FC, decreasing = T),]
+})
+goi <- sapply(goi, function(x)x$GeneID)
+goi <- unique(unname(unlist(goi)))
+
+plotdat <- subset(am, subset = label.subset != "AM 5")
+
+#mapal <- colorRampPalette(RColorBrewer::brewer.pal(11,"BrBG"))(256)
+set.seed(101010)
+DoHeatmap(subset(plotdat, downsample = 10000), features = goi, group.colors = cols, angle = 0, hjust = 0.5, vjust = 0.5, group.bar.height = 0.03, size = 0) + theme(axis.text.y = element_blank(), legend.position = "none") #scale_fill_gradientn(colors = c("#fa00fa","#101000","#101000","#101000","#f9fa00"))
+p1 <- ggpubr::get_legend(p1)
+p1 <- ggpubr::as_ggplot(p1)
+p1
+ggsave("Manuscript_bioxiv/Figures/dump/heatmap_legend.pdf", p1, width = 1, height = 3, units = "in")
+
+ggsave("Manuscript_bioxiv/Figures/dump/heatmap_amsubsets.png", width = 3.85, height = 2, units = "in")
+```
+
+
+# fgsea
+```{r}
+all_gene_sets = msigdbr(species = "Homo sapiens")
+gene_subcats = sapply(all_gene_sets$gs_name, function(x){
+  out = gsub('_.*', '', x)
+  out = gsub('(GSE).*', '\\1', out)
+}, USE.NAMES = F)
+
+filtered_gene_sets <- all_gene_sets[which(gene_subcats %in% c("GOBP", "GOMF", "REACTOME", "KEGG", "HALLMARK")),]
+filtered_gene_sets <- all_gene_sets[all_gene_sets$gs_name %in% c("HALLMARK_TNFA_SIGNALING_VIA_NFKB", "REACTOME_TNFR2_NON_CANONICAL_NF_KB_PATHWAY", "REACTOME_INTERLEUKIN_1_SIGNALING", "REACTOME_INTERLEUKIN_4_AND_INTERLEUKIN_13_SIGNALING", "REACTOME_MITOCHONDRIAL_BIOGENESIS"),]
+
+msigdbr_list = split(x = filtered_gene_sets$gene_symbol, f = filtered_gene_sets$gs_name)
+
+topmarkersPercluster <- marker_genes
+fgsea_genelist = lapply(seq_along(topmarkersPercluster), function(i){
+  x = topmarkersPercluster[[i]]
+  print(names(topmarkersPercluster)[i])
+  minx <- x[x$p_val != 0,]
+  x$p_val[x$p_val == 0] <- min(minx$p_val)
+  preranked = x %>%
+    #mutate_at(2:6,~replace(., . == 0, min(.[.>0], na.rm = TRUE))) %>%
+    mutate(logp = -log10(p_val) * sign(avg_log2FC)) %>%
+    #filter(!grepl('Mt-', GeneID)) %>%
+    arrange(logp)
+  rankset = setNames(preranked$logp, preranked$GeneID)
+  fgsea_out = fgsea(pathways = msigdbr_list, stats = rankset)
+  fgsea_out$leadingEdge = sapply(fgsea_out$leadingEdge, function(x){
+    x = paste(x, collapse = ',')
+  })
+  fgsea_out = fgsea_out[order(fgsea_out$padj),]
+  return(fgsea_out)
+})
+names(fgsea_genelist) <- names(topmarkersPercluster)
+
+gsea_signif = lapply(fgsea_genelist, function(x){
+  x = x[x$pval <= 0.05,]
+  x <- x[x$size >= 10,]
+  new_pathway = sapply(strsplit(x$pathway, split = '_'), function(y){
+    y = y[-1]
+    out = paste(y, collapse = ' ')
+  })
+  x$pathway2 = new_pathway
+  x = x[order(x$NES, decreasing = T),]
+})
+
+#combine cell types
+combined_fgsea = lapply(gsea_signif, function(x){
+  xlist = x[order(x$NES, decreasing = T),]
+  xlist$pathway3 = gsub('_', ' ', xlist$pathway)
+  xlist$pathway3 = str_wrap(xlist$pathway3, 50)
+  xlist$pathway3 = factor(xlist$pathway3, levels = rev(unique(xlist$pathway3)))
+  xlist$status = cut(xlist$NES, breaks = c(-Inf, 0, Inf), 
+                     labels  = c('Down-reg', 'Up-reg'))
+  return(xlist)
+})
+
+combined_fgsea = bind_rows(combined_fgsea, .id = "cluster")
+
+plotdat <- combined_fgsea
+#plotdat <- combined_fgsea[grep("mitochond|ATP|oxidative|NADH|TCA|electron|cytokine|interleukin|TNF", combined_fgsea$pathway3, ignore.case = T),]
+plotdat$pathway3 <- as.character(plotdat$pathway3)
+pathorder <- c(grep("interleukin|cytokine",unique(plotdat$pathway3), invert = T, value = T, ignore.case = T), grep("interleukin|cytokine",unique(plotdat$pathway3), invert = F, value = T, ignore.case = T))
+plotdat$pathway3 <- factor(plotdat$pathway3, levels = rev(pathorder))
+plotdat$neglog10pval <- -log10(plotdat$pval)
+plotdat$group <- ifelse(plotdat$NES > 0, "Upreg", "Downreg")
+
+ggplot(plotdat, aes(x = cluster, y = pathway3, color = NES)) +
+    geom_point(aes(size = size)) +
+    xlab("") +
+    theme_Publication() + 
+    scale_color_gradient2(low = '#2166ac', high = '#b2182b') +
+    scale_size(range = c(2, 6)) +
+    theme(axis.text.x = element_text(size = 10, angle = 90, vjust = 0.5, hjust = 1),
+          axis.text.y = element_text(size = 10),
+          axis.title.y = element_blank(),
+          plot.title = element_text(size = 12, face = 'bold', hjust = 0.5,
+                                    vjust = 1),
+          legend.position = 'right',
+          legend.direction = 'vertical')
+
+ggsave("Manuscript_bioxiv/Figures/dump/amsubset_gsea.pdf", width = 9, height = 300, limitsize = F, units = "in")
+```
+
+#make violin of all genes
+```{r}
+goi <- sapply(marker_genes, function(x){
+  out <- x[x$avg_log2FC >= .0378 & x$p_val_adj <= 0.05,]
+  out <- out[order(out$avg_log2FC, decreasing = T),]
+  out <- out[1:200,]
+  out <- out$GeneID
+})
+goi <- unique(unname(unlist(goi)))
+
+plotlist <- lapply(goi, function(x){
+  print(x)
+  out <- VlnPlot(am, group.by = "label.subset", features = x, pt.size = 0) + theme(legend.position = "none", axis.title.x = element_blank(), axis.title.y = element_blank())
+})
+
+ggsave(filename = "Manuscript_bioxiv/Figures/dump/amsubsets_allgenes.pdf", 
+       plot = gridExtra::marrangeGrob(plotlist, nrow=4, ncol=4), 
+       width = 16, height = 16, units = 'in')
+```
+
+
+#AM1
+```{r}
+mypaths <- fgsea_genelist$`AM 1`
+
+goi <- mypaths[mypaths$pathway %in% c("HALLMARK_TNFA_SIGNALING_VIA_NFKB", "HALLMARK_INFLAMMATORY_RESPONSE", "HALLMARK_IL6_JAK_STAT3_SIGNALING", "GOBP_REGULATION_OF_FATTY_ACID_METABOLIC_PROCESS"),]
+goi <- goi$leadingEdge
+goi <- sapply(goi, function(x){
+  out <- strsplit(x, split = ",")
+  out <- unlist(out)
+})
+goi <- unique(unlist(goi))
+
+plotlist <- lapply(goi, function(x){
+  print(x)
+  out <- VlnPlot(am, group.by = "label.subset", features = x, pt.size = 0) + theme(legend.position = "none", axis.title.x = element_blank(), axis.title.y = element_blank())
+})
+
+ggsave(filename = "Manuscript_bioxiv/Figures/dump/amsubsets_AM1genes.pdf", 
+       plot = gridExtra::marrangeGrob(plotlist, nrow=4, ncol=4), 
+       width = 16, height = 16, units = 'in')
+
+#gene list
+goi <- c("IL1B", "PTGS2", "IL6", "TNF", "NFKBIA", "ATF3")
+lapply(goi, function(x){
+  out <- VlnPlot(am, group.by = "label.subset", features = x, pt.size = 0) + theme(legend.position = "none", axis.title.x = element_blank(), axis.title.y = element_blank())
+  ggsave(paste("Manuscript_bioxiv/Figures/dump/amsubset_", x, ".pdf", sep = ""), out, width = 4, height = 4, units = "in")
+})
+
+goi <- c("IL1B", "IL1RN", "CCL20", "CXCL8", "CXCL3", "IER3", "SOD2", "MT1G", "CCL3", "CCL4", "CCL3L1", "CCL4L2")
+lapply(goi, function(x){
+  out <- VlnPlot(am, group.by = "label.subset", features = x, pt.size = 0) + theme(legend.position = "none", axis.title.x = element_blank(), axis.title.y = element_blank())
+  ggsave(paste("Manuscript_bioxiv/Figures/dump/amsubset_", x, ".pdf", sep = ""), out, width = 4, height = 4, units = "in")
+})
+```
+
+# AM2
+```{r}
+mypaths <- fgsea_genelist$`AM 2`
+
+goi <- mypaths[mypaths$pathway %in% c("HALLMARK_OXIDATIVE_PHOSPHORYLATION", "REACTOME_METABOLISM_OF_AMINO_ACIDS_AND_DERIVATIVES", "KEGG_FATTY_ACID_METABOLISM", "GOBP_PEPTIDE_METABOLIC_PROCESS"),]
+
+goi <- goi$leadingEdge
+goi <- sapply(goi, function(x){
+  out <- strsplit(x, split = ",")
+  out <- unlist(out)
+})
+goi <- unique(unlist(goi))
+
+plotlist <- lapply(goi, function(x){
+  print(x)
+  out <- VlnPlot(am, group.by = "label.subset", features = x, pt.size = 0) + theme(legend.position = "none", axis.title.x = element_blank(), axis.title.y = element_blank())
+})
+
+ggsave(filename = "Manuscript_bioxiv/Figures/dump/amsubsets_AM2genes.pdf", 
+       plot = gridExtra::marrangeGrob(plotlist, nrow=4, ncol=4), 
+       width = 16, height = 16, units = 'in')
+
+goi <- c("IDH1", "MDH1", "GLUL")
+lapply(goi, function(x){
+  out <- VlnPlot(am, group.by = "label.subset", features = x, pt.size = 0) + theme(legend.position = "none", axis.title.x = element_blank(), axis.title.y = element_blank())
+  ggsave(paste("Manuscript_bioxiv/Figures/dump/amsubset_", x, ".pdf", sep = ""), out, width = 4, height = 4, units = "in")
+})
+
+```
+
+# AM3
+```{r}
+mypaths <- fgsea_genelist$`AM 3`
+
+goi <- mypaths[mypaths$pathway %in% c("REACTOME_CELL_CYCLE", "REACTOME_AUTOPHAGY", "HALLMARK_HEME_METABOLISM"),]
+
+goi <- goi$leadingEdge
+goi <- sapply(goi, function(x){
+  out <- strsplit(x, split = ",")
+  out <- unlist(out)
+})
+goi <- unique(unlist(goi))
+
+plotlist <- lapply(goi, function(x){
+  print(x)
+  out <- VlnPlot(am, group.by = "label.subset", features = x, pt.size = 0) + theme(legend.position = "none", axis.title.x = element_blank(), axis.title.y = element_blank())
+})
+
+ggsave(filename = "Manuscript_bioxiv/Figures/dump/amsubsets_AM3genes.pdf", 
+       plot = gridExtra::marrangeGrob(plotlist, nrow=4, ncol=4), 
+       width = 16, height = 16, units = 'in')
+
+goi <- c("HBB", "MT-ATP8", "MT−ND4L", "MT−ND5")
+lapply(goi, function(x){
+  out <- VlnPlot(am, group.by = "label.subset", features = x, pt.size = 0) + theme(legend.position = "none", axis.title.x = element_blank(), axis.title.y = element_blank())
+  ggsave(paste("Manuscript_bioxiv/Figures/dump/amsubset_", x, ".pdf", sep = ""), out, width = 4, height = 4, units = "in")
+})
+```
+
+#AM4
+```{r}
+mypaths <- fgsea_genelist$`AM 4`
+
+goi <- mypaths[mypaths$pathway %in% c("GOBP_CHOLESTEROL_STORAGE", "HALLMARK_IL2_STAT5_SIGNALING", "REACTOME_SIGNALING_BY_TGFB_FAMILY_MEMBERS", "REACTOME_SIGNALING_BY_VEGF"),]
+
+goi <- goi$leadingEdge
+goi <- sapply(goi, function(x){
+  out <- strsplit(x, split = ",")
+  out <- unlist(out)
+})
+goi <- unique(unlist(goi))
+
+plotlist <- lapply(goi, function(x){
+  print(x)
+  out <- VlnPlot(am, group.by = "label.subset", features = x, pt.size = 0) + theme(legend.position = "none", axis.title.x = element_blank(), axis.title.y = element_blank())
+})
+
+ggsave(filename = "Manuscript_bioxiv/Figures/dump/amsubsets_AM4genes.pdf", 
+       plot = gridExtra::marrangeGrob(plotlist, nrow=4, ncol=4), 
+       width = 16, height = 16, units = 'in')
+
+goi <- c("BCL2", "PPARG", "MAPK1", "SMAD2", "AKT3")
+lapply(goi, function(x){
+  out <- VlnPlot(am, group.by = "label.subset", features = x, pt.size = 0) + theme(legend.position = "none", axis.title.x = element_blank(), axis.title.y = element_blank())
+  ggsave(paste("Manuscript_bioxiv/Figures/dump/amsubset_", x, ".pdf", sep = ""), out, width = 4, height = 4, units = "in")
+})
+```
+
+```{r}
+all_gene_sets = msigdbr(species = "Homo sapiens")
+
+filtered_gene_sets <- all_gene_sets[all_gene_sets$gs_name %in% c("HALLMARK_TNFA_SIGNALING_VIA_NFKB", "HALLMARK_INFLAMMATORY_RESPONSE", "HALLMARK_IL6_JAK_STAT3_SIGNALING", "GOBP_REGULATION_OF_FATTY_ACID_METABOLIC_PROCESS", "HALLMARK_OXIDATIVE_PHOSPHORYLATION", "REACTOME_METABOLISM_OF_AMINO_ACIDS_AND_DERIVATIVES", "KEGG_FATTY_ACID_METABOLISM", "GOBP_PEPTIDE_METABOLIC_PROCESS", "REACTOME_CELL_CYCLE", "REACTOME_AUTOPHAGY", "HALLMARK_HEME_METABOLISM", "GOBP_CHOLESTEROL_STORAGE", "HALLMARK_IL2_STAT5_SIGNALING", "REACTOME_SIGNALING_BY_TGFB_FAMILY_MEMBERS", "REACTOME_SIGNALING_BY_VEGF"),]
+
+msigdbr_list = split(x = filtered_gene_sets$gene_symbol, f = filtered_gene_sets$gs_name)
+
+topmarkersPercluster <- marker_genes
+fgsea_genelist = lapply(seq_along(topmarkersPercluster), function(i){
+  x = topmarkersPercluster[[i]]
+  print(names(topmarkersPercluster)[i])
+  minx <- x[x$p_val != 0,]
+  x$p_val[x$p_val == 0] <- min(minx$p_val)
+  preranked = x %>%
+    #mutate_at(2:6,~replace(., . == 0, min(.[.>0], na.rm = TRUE))) %>%
+    mutate(logp = -log10(p_val) * sign(avg_log2FC)) %>%
+    #filter(!grepl('Mt-', GeneID)) %>%
+    arrange(logp)
+  rankset = setNames(preranked$logp, preranked$GeneID)
+  fgsea_out = fgsea(pathways = msigdbr_list, stats = rankset)
+  fgsea_out$leadingEdge = sapply(fgsea_out$leadingEdge, function(x){
+    x = paste(x, collapse = ',')
+  })
+  fgsea_out = fgsea_out[order(fgsea_out$padj),]
+  return(fgsea_out)
+})
+names(fgsea_genelist) <- names(topmarkersPercluster)
+
+gsea_signif = lapply(fgsea_genelist, function(x){
+  x = x[x$pval <= 0.05,]
+  #x <- x[x$size >= 10,]
+  new_pathway = sapply(strsplit(x$pathway, split = '_'), function(y){
+    y = y[-1]
+    out = paste(y, collapse = ' ')
+  })
+  x$pathway2 = new_pathway
+  x = x[order(x$NES, decreasing = T),]
+})
+
+#combine cell types
+combined_fgsea = lapply(gsea_signif, function(x){
+  xlist = x[order(x$NES, decreasing = T),]
+  xlist$pathway3 = gsub('_', ' ', xlist$pathway)
+  xlist$pathway3 = str_wrap(xlist$pathway3, 50)
+  xlist$pathway3 = factor(xlist$pathway3, levels = rev(unique(xlist$pathway3)))
+  xlist$status = cut(xlist$NES, breaks = c(-Inf, 0, Inf), 
+                     labels  = c('Down-reg', 'Up-reg'))
+  return(xlist)
+})
+
+combined_fgsea = bind_rows(combined_fgsea, .id = "cluster")
+
+plotdat <- combined_fgsea
+#plotdat <- combined_fgsea[grep("mitochond|ATP|oxidative|NADH|TCA|electron|cytokine|interleukin|TNF", combined_fgsea$pathway3, ignore.case = T),]
+plotdat$pathway3 <- as.character(plotdat$pathway3)
+pathorder <- c(grep("interleukin|cytokine",unique(plotdat$pathway3), invert = T, value = T, ignore.case = T), grep("interleukin|cytokine",unique(plotdat$pathway3), invert = F, value = T, ignore.case = T))
+plotdat$pathway3 <- factor(plotdat$pathway3, levels = rev(pathorder))
+plotdat$neglog10pval <- -log10(plotdat$pval)
+plotdat$group <- ifelse(plotdat$NES > 0, "Upreg", "Downreg")
+
+plotdat <- plotdat[-which(plotdat$pathway == "REACTOME_CELL_CYCLE" & plotdat$cluster == "AM 3"),]
+plotdat <- plotdat[-which(plotdat$pathway == "HALLMARK_INFLAMMATORY_RESPONSE" & plotdat$cluster == "AM 1"),]
+
+plotdat$pathway <- factor(plotdat$pathway, levels = c("HALLMARK_OXIDATIVE_PHOSPHORYLATION", "REACTOME_METABOLISM_OF_AMINO_ACIDS_AND_DERIVATIVES", "KEGG_FATTY_ACID_METABOLISM", "GOBP_PEPTIDE_METABOLIC_PROCESS","REACTOME_CELL_CYCLE", "REACTOME_AUTOPHAGY", "HALLMARK_HEME_METABOLISM", "HALLMARK_TNFA_SIGNALING_VIA_NFKB", "HALLMARK_INFLAMMATORY_RESPONSE", "HALLMARK_IL6_JAK_STAT3_SIGNALING", "GOBP_REGULATION_OF_FATTY_ACID_METABOLIC_PROCESS","GOBP_CHOLESTEROL_STORAGE", "HALLMARK_IL2_STAT5_SIGNALING", "REACTOME_SIGNALING_BY_TGFB_FAMILY_MEMBERS", "REACTOME_SIGNALING_BY_VEGF"))
+
+ggplot(plotdat, aes(x = cluster, y = pathway, color = NES)) +
+    geom_point(aes(size = size)) +
+    xlab("") +
+    theme_Publication() + 
+    #labs(title = "GSEA of each cluster compared to other clusters") +
+    scale_color_gradient2(low = '#2166ac', high = '#b2182b') +
+    scale_size(range = c(2, 6)) + scale_y_discrete(position = "right") +
+    theme(axis.text.x = element_text(size = 10, angle = 90, vjust = 0.5, hjust = 1),
+          axis.text.y = element_text(size = 10),
+          axis.title.y = element_blank(),
+          plot.title = element_text(size = 12, face = 'bold', hjust = 0,
+                                    vjust = 1),
+          legend.position = 'right',
+          legend.direction = 'vertical') 
+
+ggsave("Manuscript_bioxiv/Figures/dump/amsubset_gsea_fil.png", width =7, height = 5, limitsize = F, units = "in")
+```
+```{r}
+VlnPlot(am, group.by = "label.subset", features = "MRC1", pt.size = 0) + theme(legend.position = "none", axis.title.x = element_blank(), axis.title.y = element_blank())
+```
+
+```{r}
+goi <- c("NFKBIA", "ATF3", "PTGS2", "TNF", "TNFAIP3", "IL1B", "CCL20", "CXCL8", "CXCL3", "CXCL2", "CCL3", "CCL4", "IL1RN", "HBB", "SOD2", "BCL2", "MAPK1", "SMAD2", "PPARG", "AKT3", "IDH1", "MDH1", "GLUL")
+
+
+plotdat <- subset(am, subset = label.subset != "AM 5")
+
+VlnPlot(plotdat, group.by = "label.subset", features = goi, split.by = "label.subset", split.plot = T)
+
+lapply(goi, function(x){
+  out <- VlnPlot(plotdat, group.by = "label.subset", features = x, pt.size = 0, cols = cols) + theme(legend.position = "none", axis.title.x = element_blank(), axis.title.y = element_blank(), axis.text.x = element_blank(), plot.title = element_text(size = 8), axis.text.y = element_text(size = 7), plot.margin = margin(-1, -1, -1, -1, unit = "pt"))
+  ggsave(paste("Manuscript_bioxiv/Figures/dump/amsubset_", x, ".pdf", sep = ""), out, width = 1.3, height = 1.3, units = "in")
+})
+```
+
+# fetch data for violin plots 
+```{r}
+goi <- c("SOD2","TNFAIP3","KDM6B","IL1A","IL6","EDN1","HP","GCH1","EZH2","PLK3","TXN","FOSL1","FER","FOXO3","HBB","ERN1","PPP1R15B","JUN","FOS","NFE2L2","KLF2","MAP3K5","PDGFD","ANXA1","UBE3A","NR4A3","SPHK1","SRC")
+
+countdata <- FetchData(object = am, layer = "data", vars = goi) %>% rownames_to_column("Cell")
+
+metadata <- am@meta.data %>% 
+  select(hiv_timepoint, label.subset) %>% rownames_to_column("Cell")
+
+metadata <- merge(metadata, countdata, by = "Cell")
+
+plotdat <- melt(metadata, id.vars = c("Cell", "hiv_timepoint", "label.subset"))
+plotdat <- plotdat[plotdat$label.subset != "AM 5",]
+plotdat$variable <- factor(plotdat$variable, levels = rev(goi))
+
+#remove later
+#####
+#plotdat <- plotdat[plotdat$hiv_timepoint %in% c("")]
+
+p <- ggplot(plotdat, aes(x = value, y = variable, fill = label.subset)) + geom_violin(linewidth = 0.1, scale = "width") + facet_wrap(.~label.subset, ncol = 4) + scale_x_continuous(labels = seq(0, 6, 2), breaks = seq(0, 6, 2), limits = c(0, 6.1)) + scale_fill_manual(values = cols) + theme_Publication() +  theme(legend.position = "none", axis.title.x = element_blank(), axis.title.y = element_blank(), strip.text.x = element_text(margin = margin(0,0,0,0, "cm")))
+p
+g <- ggplot_gtable(ggplot_build(p))
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- scales::alpha(cols[1:4], alpha = 0.5)
+k <- 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k <- k+1
+}
+
+pdf("Manuscript_bioxiv/Figures/dump/amsubset_violin.pdf", width = 3.5, height = 7)
+grid::grid.draw(g)
+dev.off()
+
+ggsave("Manuscript_bioxiv/Figures/dump/amsubset_violin.pdf", width = 3.5, height = 7, units = "in")
+```
+
+
+```{r}
+goi <- c("NFKBIA", "ATF3", "PTGS2", "TNF", "TNFAIP3", "IL1B", "CCL20", "CXCL8", "CXCL3", "CXCL2", "CCL3", "CCL4", "IL1RN", "HBB", "SOD2", "IDH1", "MDH1", "GLUL", "BCL2", "MAPK1", "SMAD2", "PPARG", "AKT3")
+plotdat <- subset(am, subset = label.subset != "AM 5")
+
+plotlist <- lapply(goi, function(x){
+  out <- VlnPlot(plotdat, group.by = "label.subset", features = x, pt.size = 0, cols = cols) + theme(legend.position = "none", axis.title.x = element_blank(), axis.title.y = element_blank())
+})
+
+ggsave(filename = "Manuscript_bioxiv/Figures/dump/amsubsets_TNFgenes.pdf", 
+       plot = gridExtra::marrangeGrob(plotlist, nrow=4, ncol=4), 
+       width = 16, height = 16, units = 'in')
+```
+
+
+```{r}
+amsubset <- sort(as.character(unique(am$label.subset)))
+Idents(am) <- "hiv_timepoint"
+topTables_am_posneg4hrs = sapply(amsubset, 
+                         simplify = F, 
+                         USE.NAMES = T, function(x){
+                           print(x)
+                           subs <- subset(am,  
+                                          subset = label.subset ==  x)
+                           Idents(subs) <- "hiv_timepoint"
+                           subs <- subset(subs, subset = hiv_timepoint %in% c("HC+Mtb", "PLWH+Mtb"))
+                           df <- FindMarkers(subs, ident.1 = "PLWH+Mtb", 
+                                             ident.2 = "HC+Mtb",
+                                             only.pos = F)
+                           df <- rownames_to_column(df, var = 'GeneID')
+                           return(df)
+                         })
+```
+# Violin plots of topgenes that change in AM3 between HC+Mtb and PLWH+Mtb
+```{r}
+goi <- topTables_am_posneg4hrs$`AM 3`
+goi <- goi[abs(goi$avg_log2FC) >= 0.378 & goi$avg_log2FC <= 0.05,]
+goi <- goi[order(goi$avg_log2FC, decreasing = F),]
+goi <- goi$GeneID[1:200]
+
+goi <- c("CCL3L1", "CCL4L2", "IL6", "TNF", "TNFAIP6", "CCL20", "CCL4", "IL1A", "IL1B", "NFKBIZ", "CCL3", "CXCL2", "IER3", "LUCAT1")
+countdata <- FetchData(object = am, layer = "data", vars = goi) %>% rownames_to_column("Cell")
+
+metadata <- am@meta.data %>% 
+  select(hiv_timepoint, label.subset) %>% rownames_to_column("Cell")
+
+metadata <- merge(metadata, countdata, by = "Cell")
+
+plotdat <- melt(metadata, id.vars = c("Cell", "hiv_timepoint", "label.subset"))
+plotdat <- plotdat[plotdat$label.subset == "AM 3",]
+plotdat <- plotdat[plotdat$hiv_timepoint %in% c("HC+Mtb", "PLWH+Mtb"),]
+plotdat$variable <- factor(plotdat$variable, levels = c("CCL4", "CCL20", "TNFAIP6", "TNF", "IL6", "CCL4L2", "CCL3L1", "LUCAT1", "IER3", "CXCL2", "CCL3", "NFKBIZ", "IL1B", "IL1A"))
+
+plotdat <- split(plotdat, f = plotdat$variable)
+plotlist <- lapply(plotdat, function(x){
+  ggplot(x, aes(x = hiv_timepoint, y = value, fill = "#7fc97f")) + geom_violin(linewidth = 0.1, scale = "width") + labs(title = unique(x$variable)) + theme_Publication() +  theme(legend.position = "none", axis.title.x = element_blank(), axis.title.y = element_blank(), strip.text.x = element_text(margin = margin(0,0,0,0, "cm")), plot.title = element_text(hjust = 0.5))
+})
+
+p1 <- ggplot(plotdat[plotdat$variable %in% goi[1:7],], aes(x = value, y = variable)) + geom_violin(linewidth = 0.1, scale = "width", aes(fill = hiv_timepoint)) + scale_fill_manual(values = c("#b2df8a", "#ff7f00")) + #stat_compare_means(label = "p.signif", comparisons = list(c("HC+Mtb", "PLWH+Mtb")), vjust = 0.6) +
+  facet_wrap(.~hiv_timepoint) + xlab("Expression") + theme_Publication() +  theme(legend.position = "bottom", axis.title.x = element_text(size = 12, margin=margin(-3,0,0,0)), axis.title.y = element_blank(), strip.text.x = element_text(margin = margin(0,0,0,0, "cm"), size = 14), plot.title = element_text(hjust = 0.5), axis.text.y = element_text(size = 12))
+p2 <- ggplot(plotdat[plotdat$variable %in% goi[8:14],], aes(x = value, y = variable)) + geom_violin(linewidth = 0.1, scale = "width", aes(fill = hiv_timepoint)) + scale_fill_manual(values = c("#b2df8a", "#ff7f00")) + #stat_compare_means(label = "p.signif", comparisons = list(c("HC+Mtb", "PLWH+Mtb")), vjust = 0.6) +
+  facet_wrap(.~hiv_timepoint) + xlab("Expression") + theme_Publication() +  theme(legend.position = "bottom", axis.title.x = element_text(size = 12, margin=margin(-3,0,0,0)), axis.title.y = element_blank(), strip.text.x = element_text(margin = margin(0,0,0,0, "cm"), size = 14), plot.title = element_text(hjust = 0.5), axis.text.y = element_text(size = 12))
+
+p1 + plot_spacer() + p2 + plot_layout(widths = c(5, -1.02, 5), guides = "collect") & theme(legend.position = "none", legend.title = element_blank(), legend.margin=margin(0,0,0,0), legend.box.margin=margin(-10,-10,-10,-10), legend.text = element_text(size = 14))
+ggsave(filename = "Manuscript_bioxiv/Figures/dump/am3_deg_goi.pdf", width = 7, height = 5, units = "in")
+```
+
+
+```{r}
+all_gene_sets = msigdbr(species = "Homo sapiens")
+
+filtered_gene_sets <- all_gene_sets[which(gene_subcats %in% c("REACTOME", "HALLMARK")),]
+
+filtered_gene_sets <- all_gene_sets[grep("oxidative|reactive", all_gene_sets$gs_name, ignore.case = T),]
+
+filtered_gene_sets <- all_gene_sets[all_gene_sets$gs_name %in% c("HALLMARK_TNFA_SIGNALING_VIA_NFKB", "HALLMARK_INFLAMMATORY_RESPONSE", "HALLMARK_IL6_JAK_STAT3_SIGNALING", "HALLMARK_OXIDATIVE_PHOSPHORYLATION", "HALLMARK_INTERFERON_GAMMA_RESPONSE", "REACTOME_INTERLEUKIN_10_SIGNALING", "HALLMARK_INTERFERON_ALPHA_RESPONSE", "HALLMARK_IL2_STAT5_SIGNALING", "GOBP_RESPONSE_TO_REACTIVE_OXYGEN_SPECIES", "GOBP_RESPONSE_TO_OXIDATIVE_STRESS"),]
+
+msigdbr_list = split(x = filtered_gene_sets$gene_symbol, f = filtered_gene_sets$gs_name)
+
+topmarkersPercluster <- topTables_am_posneg4hrs[c("AM 1", "AM 2", "AM 3", "AM 4")]
+fgsea_genelist = lapply(seq_along(topmarkersPercluster), function(i){
+  x = topmarkersPercluster[[i]]
+  print(names(topmarkersPercluster)[i])
+  minx <- x[x$p_val != 0,]
+  x$p_val[x$p_val == 0] <- min(minx$p_val)
+  preranked = x %>%
+    #mutate_at(2:6,~replace(., . == 0, min(.[.>0], na.rm = TRUE))) %>%
+    mutate(logp = -log10(p_val) * sign(avg_log2FC)) %>%
+    #filter(!grepl('Mt-', GeneID)) %>%
+    arrange(logp)
+  rankset = setNames(preranked$logp, preranked$GeneID)
+  fgsea_out = fgsea(pathways = msigdbr_list, stats = rankset)
+  fgsea_out$leadingEdge = sapply(fgsea_out$leadingEdge, function(x){
+    x = paste(x, collapse = ',')
+  })
+  fgsea_out = fgsea_out[order(fgsea_out$padj),]
+  return(fgsea_out)
+})
+names(fgsea_genelist) <- names(topmarkersPercluster)
+
+gsea_signif = lapply(fgsea_genelist, function(x){
+  x = x[x$pval <= 0.05,]
+  #x <- x[x$size >= 10,]
+  new_pathway = sapply(strsplit(x$pathway, split = '_'), function(y){
+    y = y[-1]
+    out = paste(y, collapse = ' ')
+  })
+  x$pathway2 = new_pathway
+  x = x[order(x$NES, decreasing = T),]
+})
+
+#combine cell types
+combined_fgsea = lapply(gsea_signif, function(x){
+  xlist = x[order(x$NES, decreasing = T),]
+  xlist$pathway3 = gsub('_', ' ', xlist$pathway)
+  xlist$pathway3 = str_wrap(xlist$pathway3, 50)
+  xlist$pathway3 = factor(xlist$pathway3, levels = rev(unique(xlist$pathway3)))
+  xlist$status = cut(xlist$NES, breaks = c(-Inf, 0, Inf), 
+                     labels  = c('Down-reg', 'Up-reg'))
+  return(xlist)
+})
+
+combined_fgsea = bind_rows(combined_fgsea, .id = "cluster")
+
+plotdat <- combined_fgsea
+#plotdat <- combined_fgsea[grep("mitochond|ATP|oxidative|NADH|TCA|electron|cytokine|interleukin|TNF|IL2|IL6|interferon", combined_fgsea$pathway3, ignore.case = T),]
+plotdat$pathway3 <- as.character(plotdat$pathway3)
+pathorder <- c(grep("interleukin|cytokine",unique(plotdat$pathway3), invert = T, value = T, ignore.case = T), grep("interleukin|cytokine",unique(plotdat$pathway3), invert = F, value = T, ignore.case = T))
+
+plotdat$pathway3 <- factor(plotdat$pathway3, levels = rev(pathorder))
+plotdat$neglog10pval <- -log10(plotdat$pval)
+plotdat$group <- ifelse(plotdat$NES > 0, "Upreg", "Downreg")
+
+plotdat$pathway <- factor(plotdat$pathway, levels = c("REACTOME_INTERLEUKIN_10_SIGNALING", "HALLMARK_IL6_JAK_STAT3_SIGNALING", "HALLMARK_IL2_STAT5_SIGNALING", "HALLMARK_INTERFERON_ALPHA_RESPONSE", "HALLMARK_INTERFERON_GAMMA_RESPONSE", "HALLMARK_TNFA_SIGNALING_VIA_NFKB", "HALLMARK_INFLAMMATORY_RESPONSE","GOBP_RESPONSE_TO_REACTIVE_OXYGEN_SPECIES", "GOBP_RESPONSE_TO_OXIDATIVE_STRESS", "HALLMARK_OXIDATIVE_PHOSPHORYLATION"))
+
+ggplot(plotdat, aes(x = cluster, y = pathway, color = NES)) +
+    geom_point(aes(size = size)) +
+    xlab("") +
+    theme_Publication() + 
+    #labs(title = "GSEA of each cluster compared to other clusters") +
+    scale_color_gradient2(low = '#2166ac', high = '#b2182b') +
+    scale_size(range = c(2, 6)) + scale_y_discrete(position = "right") +
+    theme(axis.text.x = element_text(size = 10, angle = 90, vjust = 0.5, hjust = 1),
+          axis.text.y = element_text(size = 10),
+          axis.title.y = element_blank(),
+          plot.title = element_text(size = 12, face = 'bold', hjust = 0,
+                                    vjust = 1),
+          legend.position = 'right',
+          legend.direction = 'vertical') 
+
+ggsave("Manuscript_bioxiv/Figures/dump/amsubset_gsea_hivnegpos4hrs.png", width = 6, height = 4, limitsize = F, units = "in")
+```
+

@@ -1,0 +1,2197 @@
+---
+title: "BAL Manuscript"
+author: "Prashant"
+date: "2023-09-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(reshape2)
+library(dplyr)
+library(readxl)
+library(writexl)
+library(patchwork)
+library(Seurat)
+library(tibble)
+library(DoubletFinder)
+library(tidyr)
+library(RColorBrewer)
+library(msigdbr)
+library(fgsea)
+library(stringr)
+library(harmony)
+source('/Users/pbajpai/Documents/Rthemes/theme_publication.R')
+source("helper_funs.R")
+```
+
+```{r}
+#rm(list = ls())
+balVer2 <- readRDS("rds_data/balver2.rds")
+balVer2$label.main2 <- factor(balVer2$label.main2, levels = c("AM", "MDM", "Neutrophils", "DC", "Monocyte", "CD4 T cell", "CD8 T cell", "Tgd", "T reg", "B cell", "NK cell", "Epithelial cells"))
+cols <- c("#386cb0","#fdb462","#7fc97f","#ef3b2c","#662506","#a6cee3",
+         "#fb9a99","#6A3D9A","#F6DF07", "#F0027F","#BF5B17", "#666666",
+         "#33A02C", "#FF7F00", "#E78AC3")
+balVer2$hiv_timepoint <- gsub("NEG 0hrs", "HC", balVer2$hiv_timepoint)
+balVer2$hiv_timepoint <- gsub("POS 0hrs", "PLWH", balVer2$hiv_timepoint)
+balVer2$hiv_timepoint <- gsub("NEG 4hrs", "HC+Mtb", balVer2$hiv_timepoint)
+balVer2$hiv_timepoint <- gsub("POS 4hrs", "PLWH+Mtb", balVer2$hiv_timepoint)
+
+balVer2$hiv_timepoint <- factor(balVer2$hiv_timepoint, levels = c("HC", "PLWH", "HC+Mtb", "PLWH+Mtb"))
+topTables_DE_pos_neg_4hrs <- readRDS("rds_data/topTables_DE_pos_neg_4hr_label_main2.rds")
+topTables_DE_pos_neg_0hrs <- readRDS("rds_data/topTables_DE_pos_neg_0hr_label_main2.rds")
+topTables_DE_neg_4hrs_vs_0hrs <- readRDS("rds_data/topTables_DE_neg_4hrs_vs_0hrs.rds")
+topTables_DE_pos_4hrs_vs_0hrs <- readRDS("rds_data/topTables_DE_pos_4hr_vs_0hr.rds")
+topTables_DE_neg_4hrs_vs_0hrs$Neutrophils <- NULL
+topTables_hivpos_4h_vs_0hr_global <- readRDS("rds_data/topTables_hivpos_4h_vs_0hr_global.rds")
+topTables_hivneg_4h_vs_0hr_global <- readRDS("rds_data/topTables_hivneg_4h_vs_0hr_global.rds")
+```
+
+# Cell Frequency
+```{r}
+FreqTable_labelmain <- data.frame("group" = paste(balVer2$hiv_timepoint, balVer2$SampleID, sep = "-"), "label.main" = balVer2$label.main2) %>% 
+  group_by(group, label.main) %>% 
+  summarise(n_cells = n()) %>% 
+  ungroup() %>% 
+  spread(label.main, n_cells, fill = 0)
+
+plotdat <- melt(FreqTable_labelmain, id.vars = c("group")) %>%
+  group_by(group) %>%
+  mutate(perc = 100 * value/sum(value)) %>%
+  ungroup()
+plotdat$status <- gsub("-.*", "", plotdat$group)
+plotdat$status <- factor(plotdat$status, levels = c("HC", "PLWH", "HC+Mtb", "PLWH+Mtb"))
+plotdat$variable <- factor(plotdat$variable, levels = rev(levels(plotdat$variable)))
+
+ggplot(plotdat, aes(x = group, y = perc, fill = variable)) + 
+  geom_bar(stat = "identity", width = 0.8) + 
+  facet_grid(.~status, scales = "free", space = "free") +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme_Publication() + 
+  scale_x_discrete(drop = T) +
+  scale_fill_manual(values = rev(cols[1:12]), name = "") +
+  theme(axis.text.x = element_blank(),
+        legend.text = element_text(size = 12),
+        legend.key.size = unit(0.6, "cm"),
+        panel.spacing = unit(0.1, "lines"), 
+        axis.title.y = element_blank(),
+        axis.ticks.x = element_blank(),
+        legend.position = "none",
+        axis.title.x = element_blank()) +
+  guides(fill=guide_legend(nrow=2,byrow=TRUE))
+
+ggsave("Manuscript_bioxiv/Figures/dump/cellfreq.pdf", width = 6, height = 5, units = "in")
+
+p1 <- ggpubr::get_legend(p1)
+p1 <- ggpubr::as_ggplot(p1)
+ggsave("Manuscript_bioxiv/Figures/dump/legend_cellfreq.pdf", p1, width = 7, height = 0.8, units = "in")
+```
+
+
+# subset legend
+```{r}
+VlnPlot(balVer2, features = "TNF", group.by = "label.main2", cols = cols)
+```
+
+
+```{r}
+library(ggVennDiagram)
+library(ReactomePA)
+library(ggbeeswarm)
+library(ggrepel)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+
+hiv_pos_up_reg <- topTables_hivpos_4h_vs_0hr_global[topTables_hivpos_4h_vs_0hr_global$avg_log2FC >= 0.378 & topTables_hivpos_4h_vs_0hr_global$p_val_adj <= 0.05,]
+hiv_pos_up_reg <- hiv_pos_up_reg %>% rownames_to_column("GeneID")
+  
+hiv_neg_up_reg <- topTables_hivneg_4h_vs_0hr_global[topTables_hivneg_4h_vs_0hr_global$avg_log2FC >= 0.378 & topTables_hivneg_4h_vs_0hr_global$p_val_adj <= 0.05,]
+hiv_neg_up_reg <- hiv_neg_up_reg %>% rownames_to_column("GeneID")
+
+hiv_pos_down_reg <- topTables_hivpos_4h_vs_0hr_global[topTables_hivpos_4h_vs_0hr_global$avg_log2FC <= -0.378 & topTables_hivpos_4h_vs_0hr_global$p_val_adj <= 0.05,]
+hiv_pos_down_reg <- hiv_pos_down_reg %>% rownames_to_column("GeneID")
+
+hiv_neg_down_reg <- topTables_hivneg_4h_vs_0hr_global[topTables_hivneg_4h_vs_0hr_global$avg_log2FC <= -0.378 & topTables_hivneg_4h_vs_0hr_global$p_val_adj <= 0.05,]
+hiv_neg_down_reg <- hiv_neg_down_reg %>% rownames_to_column("GeneID")
+
+#add hiv+ vs hiv- data
+hivposneg_0hr_up <- sapply(topTables_DE_pos_neg_0hrs, function(x){
+  x <- x[x$avg_log2FC >= 0.378 & x$p_val_adj <= 0.05,]
+  x <- x$GeneID
+})
+hivposneg_0hr_up <- unlist(hivposneg_0hr_up)
+hivposneg_0hr_up <- length(unique(hivposneg_0hr_up))
+
+hivposneg_0hr_down <- sapply(topTables_DE_pos_neg_0hrs, function(x){
+  x <- x[x$avg_log2FC <= -0.378 & x$p_val_adj <= 0.05,]
+  x <- x$GeneID
+})
+hivposneg_0hr_down <- unlist(hivposneg_0hr_down)
+hivposneg_0hr_down <- length(unique(hivposneg_0hr_down))
+
+hivposneg_4hr_up <- sapply(topTables_DE_pos_neg_4hrs, function(x){
+  x <- x[x$avg_log2FC >= 0.378 & x$p_val_adj <= 0.05,]
+  x <- x$GeneID
+})
+hivposneg_4hr_up <- unlist(hivposneg_4hr_up)
+hivposneg_4hr_up <- length(unique(hivposneg_4hr_up))
+
+hivposneg_4hr_down <- sapply(topTables_DE_pos_neg_4hrs, function(x){
+  x <- x[x$avg_log2FC <= -0.378 & x$p_val_adj <= 0.05,]
+  x <- x$GeneID
+})
+hivposneg_4hr_down <- unlist(hivposneg_4hr_down)
+hivposneg_4hr_down <- length(unique(hivposneg_4hr_down))
+
+
+hivneg_up <- length(hiv_neg_up_reg$GeneID)
+hivpos_up <- length(hiv_pos_up_reg$GeneID)
+hivneg_down <- length(hiv_neg_down_reg$GeneID)
+hivpos_down <- length(hiv_pos_down_reg$GeneID)
+
+plotdat <- data.frame(hivneg_up, hivpos_up, hivneg_down, hivpos_down, hivposneg_0hr_up, hivposneg_0hr_down, hivposneg_4hr_up, hivposneg_4hr_down)
+plotdat <- melt(plotdat)
+plotdat$group <- c("hivneg", "hivpos", "hivneg", "hivpos", "hivposneg_0hr", "hivposneg_0hr", "hivposneg_4hr", "hivposneg_4hr")
+plotdat$direction <- gsub(".*_", "", plotdat$variable)
+
+p1 <- ggplot(plotdat, aes(x = group, y = value, fill = direction)) + geom_bar(stat = "identity", position = position_stack(reverse = T), width = 0.6) + scale_fill_manual(values = c('#2166ac', '#b2182b')) + ylab("Number of DEGs") + scale_y_continuous(expand = c(0,0)) + theme_Publication() + theme(axis.title.x = element_blank(), legend.title = element_blank(), legend.margin = margin(-10,-10,-10,-10))
+p1
+ggsave("Manuscript_bioxiv/Figures/dump/DEG_overview_global_p1.pdf", p1, width = 5, height = 4, units = "in")
+
+hivneg_up <- hiv_neg_up_reg$GeneID
+hivpos_up <- hiv_pos_up_reg$GeneID
+hivneg_down <- hiv_neg_down_reg$GeneID
+hivpos_down <- hiv_pos_down_reg$GeneID
+
+#add hiv+ vs hiv- data
+hivposneg_0hr_up <- sapply(topTables_DE_pos_neg_0hrs, function(x){
+  x <- x[x$avg_log2FC >= 0.378 & x$p_val_adj <= 0.05,]
+  x <- x$GeneID
+})
+hivposneg_0hr_up <- unlist(hivposneg_0hr_up)
+hivposneg_0hr_up <- unique(hivposneg_0hr_up)
+
+hivposneg_0hr_down <- sapply(topTables_DE_pos_neg_0hrs, function(x){
+  x <- x[x$avg_log2FC <= -0.378 & x$p_val_adj <= 0.05,]
+  x <- x$GeneID
+})
+hivposneg_0hr_down <- unlist(hivposneg_0hr_down)
+hivposneg_0hr_down <- unique(hivposneg_0hr_down)
+
+hivposneg_4hr_up <- sapply(topTables_DE_pos_neg_4hrs, function(x){
+  x <- x[x$avg_log2FC >= 0.378 & x$p_val_adj <= 0.05,]
+  x <- x$GeneID
+})
+hivposneg_4hr_up <- unlist(hivposneg_4hr_up)
+hivposneg_4hr_up <- unique(hivposneg_4hr_up)
+
+hivposneg_4hr_down <- sapply(topTables_DE_pos_neg_4hrs, function(x){
+  x <- x[x$avg_log2FC <= -0.378 & x$p_val_adj <= 0.05,]
+  x <- x$GeneID
+})
+hivposneg_4hr_down <- unlist(hivposneg_4hr_down)
+hivposneg_4hr_down <- unique(hivposneg_4hr_down)
+
+###Venn diagram comparing hiv+mtb vs HC+mtb, hiv vs hc
+plotdat <- list("hivposneg0hr" = unique(c(hivposneg_0hr_up, hivposneg_0hr_down)), "hivposneg4hr" = unique(c(hivposneg_4hr_up, hivposneg_4hr_down)))
+p2 <- ggVennDiagram(plotdat, show_intersect = F, label = "count", label_alpha = 0) +  scale_color_manual(values = c("black", "black")) + theme(legend.position = "none") 
+p2$layers[[1]]$mapping <- aes(fill = name) # what is this sorcery????????
+p2 <- p2 + scale_fill_manual(values = cols)
+ggsave("Manuscript_bioxiv/Figures/dump/venn_hiv+mtb_vs_hc+mtb.pdf", width = 5, height = 8, units = "in")
+
+plotdat <- list("0hr_up" = unique(hivposneg_0hr_up), "4hr_up" = unique(hivposneg_4hr_up))
+p2 <- ggVennDiagram(plotdat, show_intersect = F, label = "count", label_alpha = 0) +  scale_color_manual(values = c("black", "black")) + theme(legend.position = "none") 
+p2$layers[[1]]$mapping <- aes(fill = name) # what is this sorcery????????
+p2 <- p2 + scale_fill_manual(values = cols)
+p2
+ggsave("Manuscript_bioxiv/Figures/dump/venn_hiv+mtb_vs_hc+mtb_up.pdf", width = 5, height = 8, units = "in")
+
+plotdat <- list("0hr_down" = unique(hivposneg_0hr_down), "4hr_down" = unique(hivposneg_4hr_down))
+p2 <- ggVennDiagram(plotdat, show_intersect = F, label = "count", label_alpha = 0) +  scale_color_manual(values = c("black", "black")) + theme(legend.position = "none") 
+p2$layers[[1]]$mapping <- aes(fill = name) # what is this sorcery????????
+p2 <- p2 + scale_fill_manual(values = cols)
+p2
+ggsave("Manuscript_bioxiv/Figures/dump/venn_hiv+mtb_vs_hc+mtb_down.pdf", width = 5, height = 8, units = "in")
+
+plotdat <- list("hivneg" = unique(c(hivneg_up, hivneg_down)), "hivpos" = unique(c(hivpos_up, hivpos_down)))
+p2 <- ggVennDiagram(plotdat, show_intersect = F, label = "count", label_alpha = 0) +  scale_color_manual(values = c("black", "black", "black", "black")) + theme(legend.position = "none") 
+p2$layers[[1]]$mapping <- aes(fill = name) # what is this sorcery????????
+p2 <- p2 + scale_fill_manual(values = cols)
+p2
+ggsave("Manuscript_bioxiv/Figures/dump/venn_hiv+mtb_vs_hiv.pdf", p2, width = 5, height = 8, units = "in")
+
+plotdat <- list("hivneg_up" = unique(hivneg_up), "hivpos_up" = unique(hivpos_up))
+p2 <- ggVennDiagram(plotdat, show_intersect = F, label = "count", label_alpha = 0) +  scale_color_manual(values = c("black", "black", "black", "black")) + theme(legend.position = "none") 
+p2$layers[[1]]$mapping <- aes(fill = name) # what is this sorcery????????
+p2 <- p2 + scale_fill_manual(values = cols)
+p2
+ggsave("Manuscript_bioxiv/Figures/dump/venn_hiv+mtb_vs_hiv_up.pdf", p2, width = 5, height = 8, units = "in")
+
+plotdat <- list("hivneg_down" = unique(hivneg_down), "hivpos_down" = unique(hivpos_down))
+p2 <- ggVennDiagram(plotdat, show_intersect = F, label = "count", label_alpha = 0) +  scale_color_manual(values = c("black", "black", "black", "black")) + theme(legend.position = "none") 
+p2$layers[[1]]$mapping <- aes(fill = name) # what is this sorcery????????
+p2 <- p2 + scale_fill_manual(values = cols)
+p2
+ggsave("Manuscript_bioxiv/Figures/dump/venn_hiv+mtb_vs_hiv_down.pdf", p2, width = 5, height = 8, units = "in")
+###
+
+plotdat <- list("hivneg" = unique(c(hivneg_up, hivneg_down)), "hivpos" = unique(c(hivpos_up, hivpos_down)), "hivposneg0hr" = unique(c(hivposneg_0hr_up, hivposneg_0hr_down)), "hivposneg4hr" = unique(c(hivposneg_4hr_up, hivposneg_4hr_down)))
+p2 <- ggVennDiagram(plotdat, show_intersect = F, label = "count", label_alpha = 0) +  scale_color_manual(values = c("black", "black", "black", "black")) + theme(legend.position = "none") 
+p2$layers[[1]]$mapping <- aes(fill = name) # what is this sorcery????????
+p2 <- p2 + scale_fill_manual(values = cols)
+p2 <- p2 + scale_fill_manual(values = lighten(cols, 0.4))
+p2
+ggsave("Manuscript_bioxiv/Figures/dump/DEG_overview_global_p2.pdf", p2, width = 5, height = 5, units = "in")
+
+hivneg_up <- hiv_neg_up_reg$GeneID
+hivpos_up <- hiv_pos_up_reg$GeneID
+hivneg_down <- hiv_neg_down_reg$GeneID
+hivpos_down <- hiv_pos_down_reg$GeneID
+
+hivneg <- unique(c(hivneg_up, hivneg_down))
+hivpos <- unique(c(hivpos_up, hivpos_down))
+
+hivneg_unique <- setdiff(hivneg, hivpos)
+hivpos_unique <- setdiff(hivpos, hivneg)
+hivnegpos_common <- intersect(hivpos, hivneg)
+  
+  
+entrez_genes <- mapIds(org.Hs.eg.db, keys = hivneg_unique, column = "ENTREZID", keytype = "SYMBOL")
+out_hivneg_unique <- enrichPathway(gene = entrez_genes)
+out_hivneg_unique <- out_hivneg_unique@result
+out_hivneg_unique$group <- "hivneg_unique"
+out_hivneg_unique <- out_hivneg_unique[order(out_hivneg_unique$Description),]
+
+entrez_genes <- mapIds(org.Hs.eg.db, keys = hivpos_unique,column = "ENTREZID", keytype = "SYMBOL")
+out_hivpos_unique <- enrichPathway(gene = entrez_genes)
+out_hivpos_unique <- out_hivpos_unique@result
+out_hivpos_unique$group <- "hivpos_unique"
+out_hivpos_unique <- out_hivpos_unique[order(out_hivpos_unique$Description),]
+
+entrez_genes <- mapIds(org.Hs.eg.db, keys = hivnegpos_common,column = "ENTREZID", keytype = "SYMBOL")
+out_hivnegpos_common <- enrichPathway(gene = entrez_genes)
+out_hivnegpos_common <- out_hivnegpos_common@result
+out_hivnegpos_common$group <- "hivnegpos_common"
+out_hivnegpos_common <- out_hivnegpos_common[order(out_hivnegpos_common$Description),]
+  
+out <- rbind(out_hivneg_unique, out_hivnegpos_common, out_hivpos_unique)
+out <- out[c("Description", "p.adjust", "Count", "group")]
+out$xlab <- 1:nrow(out)
+out$neglog10fdr <- -log10(out$p.adjust)
+out$fill <- ifelse(out$p.adjust <= 0.05 & out$group == "hivneg_unique", "hivneg_unique", ifelse(out$p.adjust <= 0.05 & out$group == "hivpos_unique", "hivpos_unique", ifelse(out$p.adjust <= 0.05 & out$group == "hivnegpos_common", "hivnegpos_common", "NA")))
+
+out$isannotate <- "no"
+out$isannotate[out$Description %in% c("The citric acid (TCA) cycle and respiratory electron transport", "Neutrophil degranulation", "Interferon alpha/beta signaling", "Fcgamma receptor (FCGR) dependent phagocytosis", "MAPK family signaling cascades", "Interleukin-10 signaling", "Interleukin-4 and Interleukin-13 signaling", "Neutrophil degranulation", "Interleukin-1 signaling", "The NLRP3 inflammasome", "Interleukin-17 signaling", "TNF signaling", "Interleukin-6 signaling", "Eukaryotic Translation Elongation", "Peptide chain elongation", "Cellular response to starvation", "PD-1 signaling", "Interferon gamma signaling") & out$p.adjust <= 0.05] <- "yes"
+
+out$isannotate <- ifelse(out$p.adjust <= 0.01 & grepl("cytokine|inter|immune|tnf|apoptosis|notch|apc|TCR|oxida|mitoch|TCA|PD|TCR", out$Description, ignore.case = T), "yes", "no")
+out$isannotate <- ifelse(out$p.adjust <= 0.05 & grepl("oxida|mitoch|TCA|NAD", out$Description, ignore.case = T), "yes", "no")
+out$isannotate <- "yes"
+
+axisdf = out %>% group_by(group) %>% summarize(center=( max(xlab) + min(xlab) ) / 2 )
+
+set.seed(101010)
+p3 <- ggplot(out, aes(x=xlab, y=neglog10fdr)) +
+  geom_point(aes(color=as.factor(fill), size = Count), alpha=0.8) +
+  geom_text_repel( data=subset(out, isannotate=="yes"), aes(label=Description), size=2.5, nudge_y = 2, nudge_x = 2, color= "black", segment.color = "grey") +
+  scale_x_continuous(label = axisdf$group, breaks= axisdf$center ) +
+  scale_y_continuous(expand = c(0.01, 0.01), limits = c(0,20)) + 
+  scale_size(range = c(0.3, 2.5)) +
+  scale_color_manual(values = c("#7fc97f", "#beaed4", "#fdc086", "grey90")) +
+  theme_bw() +
+  theme(panel.border = element_blank(), panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank(), axis.text.x = element_blank(), axis.ticks = element_blank(), axis.title.x = element_blank(), plot.title = element_text(vjust = 0.5, hjust = 0.5))
+p3
+ggsave("Manuscript_bioxiv/Figures/dump/DEG_overview_global_p3_ver3.pdf", p3, width = 10, height = 4, units = "in")
+
+pfinal <- (p1 + p2) / p3
+ggsave(paste("Manuscript_bioxiv/Figures/dump/DEG_overview_global.pdf", sep = ""), pfinal, width = 12, height = 9, units = "in")
+```
+
+#DEG statistics HIV+ and HIV- 
+```{r}
+hiv_pos_up_reg <- lapply(topTables_DE_pos_4hrs_vs_0hrs, function(x){
+  out <- x[x$avg_log2FC >= 0.378 & x$p_val_adj <= 0.05,]
+})
+hiv_pos_up_reg <- hiv_pos_up_reg[!names(hiv_pos_up_reg) %in% c("B cell", "T reg")]
+
+hiv_neg_up_reg <- lapply(topTables_DE_neg_4hrs_vs_0hrs, function(x){
+  out <- x[x$avg_log2FC >= 0.378 & x$p_val_adj <= 0.05,]
+})
+hiv_neg_up_reg <- hiv_neg_up_reg[!names(hiv_neg_up_reg) %in% c("B cell", "T reg")]
+
+hiv_pos_down_reg <- lapply(topTables_DE_pos_4hrs_vs_0hrs, function(x){
+  out <- x[x$avg_log2FC <= -0.378 & x$p_val_adj <= 0.05,]
+})
+hiv_pos_down_reg <- hiv_pos_down_reg[!names(hiv_pos_down_reg) %in% c("B cell", "T reg")]
+
+hiv_neg_down_reg <- lapply(topTables_DE_neg_4hrs_vs_0hrs, function(x){
+  out <- x[x$avg_log2FC <= -0.378 & x$p_val_adj <= 0.05,]
+})
+hiv_neg_down_reg <- hiv_neg_down_reg[!names(hiv_neg_down_reg) %in% c("B cell", "T reg")]
+
+celltypes <- names(hiv_neg_up_reg)
+#remove B cells and Treg: No DEGs
+celltypes <- celltypes[!celltypes %in% c("B cell", "T reg")]
+plotlist1 <- lapply(celltypes, function(x){
+  hivneg_up <- hiv_neg_up_reg[[x]]
+  hivneg_up <- length(hivneg_up$GeneID)
+  hivpos_up <- hiv_pos_up_reg[[x]]
+  hivpos_up <- length(hivpos_up$GeneID)
+  hivneg_down <- hiv_neg_down_reg[[x]]
+  hivneg_down <- length(hivneg_down$GeneID)
+  hivpos_down <- hiv_pos_down_reg[[x]]
+  hivpos_down <- length(hivpos_down$GeneID)
+  
+  plotdat <- data.frame(hivneg_up, hivpos_up, hivneg_down, hivpos_down)
+  plotdat <- melt(plotdat)
+  plotdat$group <- gsub("_.*", "", plotdat$variable)
+  plotdat$direction <- gsub(".*_", "", plotdat$variable)
+  ggplot(plotdat, aes(x = group, y = value, fill = direction)) + geom_bar(stat = "identity", position = position_stack(reverse = T), width = 0.6) + scale_fill_manual(values = c('#2166ac', '#b2182b')) + ylab("Number of DEGs") + scale_y_continuous(expand = c(0,0)) + theme_Publication() + theme(axis.title.x = element_blank(), legend.title = element_blank(), legend.margin = margin(-10,-10,-10,-10))
+})
+
+plotlist1
+```
+
+```{r}
+library(ggVennDiagram)
+
+celltypes <- names(hiv_neg_up_reg)
+#celltypes <- celltypes[!celltypes %in% c("B cell", "T reg")]
+
+plotlist2 <- lapply(celltypes, function(x){
+  hivneg_up <- hiv_neg_up_reg[[x]]
+  hivneg_up <- hivneg_up$GeneID
+  hivpos_up <- hiv_pos_up_reg[[x]]
+  hivpos_up <- hivpos_up$GeneID
+  hivneg_down <- hiv_neg_down_reg[[x]]
+  hivneg_down <- hivneg_down$GeneID
+  hivpos_down <- hiv_pos_down_reg[[x]]
+  hivpos_down <- hivpos_down$GeneID
+  
+  plotdat <- list("hivneg" = unique(c(hivneg_up, hivneg_down)), "hivpos" = unique(c(hivpos_up, hivpos_down)))
+  p1 <- ggVennDiagram(plotdat, show_intersect = F, label = "count", label_alpha = 0) +  scale_color_manual(values = c("black", "black")) + theme(legend.position = "none") 
+  p1$layers[[1]]$mapping <- aes(fill = name) # what is this sorcery????????
+  p1 + scale_fill_manual(values = c("#7fc97f", "#beaed4", "#fdc086")) 
+})
+
+plotlist2[[1]]
+```
+```{r}
+library(ReactomePA)
+library(ggbeeswarm)
+library(ggrepel)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+celltypes <- names(hiv_neg_up_reg)
+
+plotlist3 <- lapply(celltypes, function(x){
+  print(x)
+  hivneg_up <- hiv_neg_up_reg[[x]]
+  hivneg_up <- hivneg_up$GeneID
+  hivpos_up <- hiv_pos_up_reg[[x]]
+  hivpos_up <- hivpos_up$GeneID
+  hivneg_down <- hiv_neg_down_reg[[x]]
+  hivneg_down <- hivneg_down$GeneID
+  hivpos_down <- hiv_pos_down_reg[[x]]
+  hivpos_down <- hivpos_down$GeneID
+  
+  hivneg <- unique(c(hivneg_up, hivneg_down))
+  hivpos <- unique(c(hivpos_up, hivpos_down))
+  
+  hivneg_unique <- setdiff(hivneg, hivpos)
+  hivpos_unique <- setdiff(hivpos, hivneg)
+  hivnegpos_common <- intersect(hivpos, hivneg)
+  
+  #############
+  # library(clusterProfiler)
+  # exh_ref <- msigdbr(species = "Homo sapiens", category = "C7") %>% 
+  # dplyr::select(gs_name, entrez_gene)
+  # exh_ref <- exh_ref[exh_ref$gs_name == "GSE9650_EFFECTOR_VS_EXHAUSTED_CD8_TCELL_DN",]
+  # 
+  # test <- enricher(entrez_genes, TERM2GENE=exh_ref)
+  #############
+  entrez_genes <- mapIds(org.Hs.eg.db, keys = hivneg_unique, column = "ENTREZID", keytype = "SYMBOL")
+  out_hivneg_unique <- enrichPathway(gene = entrez_genes)
+  out_hivneg_unique <- out_hivneg_unique@result
+  out_hivneg_unique$group <- "hivneg_unique"
+  out_hivneg_unique <- out_hivneg_unique[order(out_hivneg_unique$Description),]
+  
+  entrez_genes <- mapIds(org.Hs.eg.db, keys = hivpos_unique,column = "ENTREZID", keytype = "SYMBOL")
+  out_hivpos_unique <- enrichPathway(gene = entrez_genes)
+  out_hivpos_unique <- out_hivpos_unique@result
+  out_hivpos_unique$group <- "hivpos_unique"
+  out_hivpos_unique <- out_hivpos_unique[order(out_hivpos_unique$Description),]
+  
+  entrez_genes <- mapIds(org.Hs.eg.db, keys = hivnegpos_common,column = "ENTREZID", keytype = "SYMBOL")
+  out_hivnegpos_common <- enrichPathway(gene = entrez_genes)
+  out_hivnegpos_common <- out_hivnegpos_common@result
+  out_hivnegpos_common$group <- "hivnegpos_common"
+  out_hivnegpos_common <- out_hivnegpos_common[order(out_hivnegpos_common$Description),]
+  
+  out <- rbind(out_hivneg_unique, out_hivnegpos_common, out_hivpos_unique)
+  out <- out[c("Description", "p.adjust", "Count", "group")]
+  out$xlab <- 1:nrow(out)
+  out$neglog10fdr <- -log10(out$p.adjust)
+  out$fill <- ifelse(out$p.adjust <= 0.05 & out$group == "hivneg_unique", "hivneg_unique", ifelse(out$p.adjust <= 0.05 & out$group == "hivpos_unique", "hivpos_unique", ifelse(out$p.adjust <= 0.05 & out$group == "hivnegpos_common", "hivnegpos_common", "NA")))
+  out$isannotate <- ifelse(out$p.adjust <= 0.01 & grepl("cytokine|inter|immune|tnf|apoptosis|notch|apc|phagocytosis|TCR|signaling", out$Description, ignore.case = T), "yes", "no")
+  
+  axisdf = out %>% group_by(group) %>% summarize(center=( max(xlab) + min(xlab) ) / 2 )
+  
+  set.seed(101010)
+  ggplot(out, aes(x=xlab, y=neglog10fdr)) +
+  geom_point(aes(color=as.factor(fill), size = Count), alpha=0.8) +
+  geom_text_repel( data=subset(out, isannotate=="yes"), aes(label=Description), size=2.5, max.overlaps = Inf, min.segment.length = unit(0, 'lines'), nudge_y = 2, nudge_x = 2) +
+  scale_x_continuous(label = axisdf$group, breaks= axisdf$center ) +
+  scale_y_continuous(expand = c(0.01, 0.01) ) + 
+  scale_size(range = c(0.3, 2.5)) +
+  scale_color_manual(values = c("#7fc97f", "#beaed4", "#fdc086", "grey90")) +
+  labs(title = x) +
+  theme_bw() +
+  theme(panel.border = element_blank(), panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank(), axis.text.x = element_blank(), axis.ticks = element_blank(), axis.title.x = element_blank(), plot.title = element_text(vjust = 0.5, hjust = 0.5))
+})
+
+plotlist3
+```
+
+# Combine the plots
+```{r}
+lapply(1:9, function(i){
+  p1 <- (plotlist1[[i]] | plotlist2[[i]]) / plotlist3[[i]]
+  ggsave(paste("Manuscript_bioxiv/Figures/dump/DEG_overview_", celltypes[i], ".pdf", sep = ""), p1, width = 12, height = 9, units = "in")
+  return(NULL)
+})
+
+
+```
+
+# Frequency table
+```{r}
+FreqTable_labelmain <- data.frame("hiv_timepoint" = balVer2$hiv_timepoint, "label.main2" = balVer2$label.main2) %>% 
+  group_by(hiv_timepoint, label.main2) %>% 
+  summarise(n_cells = n()) %>% 
+  ungroup() %>% 
+  spread(label.main2, n_cells, fill = 0)
+```
+
+# Figure: Alluvial
+```{r}
+custum.alluv <- function(data_4hrs, data_0hrs){
+  library(ggalluvial)
+  data_4hrs$res <- ifelse(data_4hrs$avg_log2FC > 0.378 & data_4hrs$p_val_adj <= 0.05, "up-reg", ifelse(data_4hrs$avg_log2FC < -0.378 & data_4hrs$p_val_adj <= 0.05, "down-reg", "no-change"))
+  data_4hrs <- data_4hrs[c("GeneID", "res")]
+  data_4hrs$group <- "4hrs"
+  print(table(data_4hrs$res))
+  
+  data_0hrs$res <- ifelse(data_0hrs$avg_log2FC > 0.378 & data_0hrs$p_val_adj <= 0.05, "up-reg", ifelse(data_0hrs$avg_log2FC < -0.378 & data_0hrs$p_val_adj <= 0.05, "down-reg", "no-change"))
+  data_0hrs <- data_0hrs[c("GeneID", "res")]
+  data_0hrs$group <- "0hrs"
+  print(table(data_0hrs$res))
+  #remove some unchaged genes
+  to_remove <- intersect(data_4hrs[data_4hrs$res == "no-change",]$GeneID, 
+                         data_0hrs[data_0hrs$res == "no-change",]$GeneID)
+  to_remove <- to_remove[1:35800]
+  
+  plotdat <- rbind(data_0hrs, data_4hrs)
+  plotdat$group <- factor(plotdat$group, levels = c("0hrs", "4hrs"))
+  plotdat <- plotdat[!plotdat$GeneID %in% to_remove,]
+  
+  p1 <- ggplot(plotdat, aes(x = group, stratum = res, alluvium = GeneID, fill = res, label = res)) + geom_flow(stat = "alluvium", width = 0.1, reverse = F) + geom_stratum(color = NA, width = 0.3, reverse = F) + theme_void() + scale_fill_manual(values = c("#377eb8", "grey90", "#e41a1c")) + theme(legend.position = "none", plot.margin = margin(-5,-20,-5,-20,unit = "pt")) 
+  return(p1)
+}
+
+custum.alluv(data_4hrs = topTables_DE_pos_neg_4hrs$`CD4 T cell`,
+             data_0hrs = topTables_DE_pos_neg_0hrs$`CD4 T cell`)
+ggsave("Manuscript_bioxiv/Figures/dump/Fig4A_alluvial_tcells_cd4.pdf", width = 1.5, height = 2, units = "in")
+
+custum.alluv(data_4hrs = topTables_DE_pos_neg_4hrs$`CD8 T cell`,
+             data_0hrs = topTables_DE_pos_neg_0hrs$`CD8 T cell`)
+ggsave("Manuscript_bioxiv/Figures/dump/Fig4A_alluvial_tcells_cd8.pdf", width = 1.5, height = 2, units = "in")
+
+custum.alluv(data_4hrs = topTables_DE_pos_neg_4hrs$AM,
+             data_0hrs = topTables_DE_pos_neg_0hrs$AM)
+ggsave("Manuscript_bioxiv/Figures/dump/Fig4A_alluvial_AM.pdf", width = 1.5, height = 2, units = "in")
+
+custum.alluv(data_4hrs = topTables_DE_pos_neg_4hrs$DC,
+             data_0hrs = topTables_DE_pos_neg_0hrs$DC)
+ggsave("Manuscript_bioxiv/Figures/dump/Fig4A_alluvial_DC.pdf", width = 1.5, height = 2, units = "in")
+
+custum.alluv(data_4hrs = topTables_DE_pos_neg_4hrs$Monocyte,
+             data_0hrs = topTables_DE_pos_neg_0hrs$Monocyte)
+ggsave("Manuscript_bioxiv/Figures/dump/Fig4A_alluvial_monocyte.pdf", width = 1.5, height = 2, units = "in")
+
+custum.alluv(data_4hrs = topTables_DE_pos_neg_4hrs$`NK cell`,
+             data_0hrs = topTables_DE_pos_neg_0hrs$`NK cell`)
+ggsave("Manuscript_bioxiv/Figures/dump/Fig4A_alluvial_NKcell.pdf", width = 1.5, height = 2, units = "in")
+```
+
+```{r}
+all_gene_sets = msigdbr(species = "Homo sapiens")
+gene_subcats = sapply(all_gene_sets$gs_name, function(x){
+  out = gsub('_.*', '', x)
+  out = gsub('(GSE).*', '\\1', out)
+}, USE.NAMES = F)
+
+filtered_gene_sets <- all_gene_sets[which(gene_subcats %in% c("GOBP", "GOMF", "REACTOME", "KEGG", "HALLMARK")),]
+#filtered_gene_sets <- all_gene_sets[all_gene_sets$gs_name %in% c("GOBP_LIPID_LOCALIZATION", "GOBP_RESPONSE_TO_LIPID", "GOBP_RESPONSE_TO_OXIDATIVE_STRESS", "GOMF_ELECTRON_TRANSFER_ACTIVITY", "REACTOME_FATTY_ACID_METABOLISM", "GOBP_ATP_METABOLIC_PROCESS", "REACTOME_MITOCHONDRIAL_FATTY_ACID_BETA_OXIDATION", "GOBP_OXIDATIVE_PHOSPHORYLATION", "GOBP_MITOCHONDRIAL_RESPIRATORY_CHAIN_COMPLEX_ASSEMBLY", "GOBP_RESPONSE_TO_CYTOKINE"),]
+
+msigdbr_list = split(x = filtered_gene_sets$gene_symbol, f = filtered_gene_sets$gs_name)
+
+fgsea_genelist = lapply(seq_along(topTables_DE_neg_4hrs_vs_0hrs), function(i){
+  x = topTables_DE_neg_4hrs_vs_0hrs[[i]]
+  print(names(topTables_DE_neg_4hrs_vs_0hrs)[i])
+  minx <- x[x$p_val != 0,]
+  x$p_val[x$p_val == 0] <- min(minx$p_val)
+  preranked = x %>%
+    #mutate_at(2:6,~replace(., . == 0, min(.[.>0], na.rm = TRUE))) %>%
+    mutate(logp = -log10(p_val) * sign(avg_log2FC)) %>%
+    #filter(!grepl('Mt-', GeneID)) %>%
+    arrange(logp)
+  rankset = setNames(preranked$logp, preranked$GeneID)
+  fgsea_out = fgsea(pathways = msigdbr_list, stats = rankset)
+  fgsea_out$leadingEdge = sapply(fgsea_out$leadingEdge, function(x){
+    x = paste(x, collapse = ',')
+  })
+  fgsea_out = fgsea_out[order(fgsea_out$padj),]
+  return(fgsea_out)
+})
+names(fgsea_genelist) = names(topTables_DE_neg_4hrs_vs_0hrs)
+
+gsea_signif = lapply(fgsea_genelist, function(x){
+  #x = x[x$pval <= 0.05,]
+  #x <- x[x$size >= 10,]
+  new_pathway = sapply(strsplit(x$pathway, split = '_'), function(y){
+    y = y[-1]
+    out = paste(y, collapse = ' ')
+  })
+  x$pathway2 = new_pathway
+  x = x[order(x$NES, decreasing = T),]
+})
+
+#combine cell types
+combined_fgsea = lapply(gsea_signif, function(x){
+  xlist = x[order(x$NES, decreasing = T),]
+  xlist$pathway3 = gsub('_', ' ', xlist$pathway)
+  xlist$pathway3 = str_wrap(xlist$pathway3, 50)
+  xlist$pathway3 = factor(xlist$pathway3, levels = rev(unique(xlist$pathway3)))
+  xlist$status = cut(xlist$NES, breaks = c(-Inf, 0, Inf), 
+                     labels  = c('Down-reg', 'Up-reg'))
+  return(xlist)
+})
+
+combined_fgsea = bind_rows(combined_fgsea, .id = 'cell_type')
+
+plotdat_hivneg <- combined_fgsea
+plotdat_hivneg <- combined_fgsea[grep("mitochond|ATP|fatty|oxidative|NADH|TCA|electron|lipid|cytokine|interleukin|TNF", combined_fgsea$pathway3, ignore.case = T),]
+plotdat_hivneg$pathway3 <- as.character(plotdat_hivneg$pathway3)
+pathorder <- c(grep("interleukin|cytokine",unique(plotdat_hivneg$pathway3), invert = T, value = T, ignore.case = T), grep("interleukin|cytokine",unique(plotdat_hivneg$pathway3), invert = F, value = T, ignore.case = T))
+plotdat_hivneg$pathway3 <- factor(plotdat_hivneg$pathway3, levels = rev(pathorder))
+plotdat_hivneg <- plotdat_hivneg[plotdat_hivneg$cell_type %in% c("AM", "MDM", "DC", "Monocyte", "Epithelial cells"),]
+plotdat_hivneg$cell_type <- factor(plotdat_hivneg$cell_type, levels = c("AM", "MDM", "DC", "Monocyte", "Epithelial cells"))
+plotdat_hivneg$group <- "HIV(-)"
+plotdat_hivneg$neglog10pval <- -log10(plotdat_hivneg$pval)
+
+plotdat_hivneg$pathway3 <- factor(plotdat_hivneg$pathway3, levels = rev(c("GOBP LIPID LOCALIZATION", "GOBP RESPONSE TO LIPID", "GOBP RESPONSE TO OXIDATIVE STRESS", "REACTOME FATTY ACID METABOLISM", "REACTOME MITOCHONDRIAL FATTY ACID BETA OXIDATION", "GOBP OXIDATIVE PHOSPHORYLATION", "GOBP ATP METABOLIC PROCESS", "GOMF ELECTRON TRANSFER ACTIVITY", "GOBP MITOCHONDRIAL RESPIRATORY CHAIN COMPLEX\nASSEMBLY", "GOBP RESPONSE TO CYTOKINE")))
+ggplot(plotdat_hivneg, aes(x = cell_type, y = pathway3, color = NES)) +
+    geom_point(aes(size = size)) +
+    xlab("") +
+    theme_Publication() + 
+    scale_color_gradient2(low = '#2166ac', high = '#b2182b') +
+    scale_size(range = c(2, 6)) +
+    theme(axis.text.x = element_text(size = 10, angle = 90, vjust = 0.5, hjust = 1),
+          axis.text.y = element_text(size = 10),
+          axis.title.y = element_blank(),
+          plot.title = element_text(size = 12, face = 'bold', hjust = 0.5,
+                                    vjust = 1),
+          legend.position = 'right',
+          legend.direction = 'vertical')
+
+ggsave("~/OneDrive - Emory University/pbajpai/KIT/Kit_10x/RFA Innate 2023/gsea_hiv_neg_4hr_vs_0hrs_innate.pdf", width = 6.5, height = 4.5, limitsize = F, units = "in")
+```
+
+```{r}
+fgsea_genelist = lapply(seq_along(topTables_DE_pos_4hrs_vs_0hrs), function(i){
+  x = topTables_DE_pos_4hrs_vs_0hrs[[i]]
+  print(names(topTables_DE_pos_4hrs_vs_0hrs)[i])
+  minx <- x[x$p_val != 0,]
+  x$p_val[x$p_val == 0] <- min(minx$p_val)
+  preranked = x %>%
+    #mutate_at(2:6,~replace(., . == 0, min(.[.>0], na.rm = TRUE))) %>%
+    mutate(logp = -log10(p_val) * sign(avg_log2FC)) %>%
+    #filter(!grepl('Mt-', GeneID)) %>%
+    arrange(logp)
+  rankset = setNames(preranked$logp, preranked$GeneID)
+  fgsea_out = fgsea(pathways = msigdbr_list, stats = rankset)
+  fgsea_out$leadingEdge = sapply(fgsea_out$leadingEdge, function(x){
+    x = paste(x, collapse = ',')
+  })
+  fgsea_out = fgsea_out[order(fgsea_out$padj),]
+  return(fgsea_out)
+})
+names(fgsea_genelist) = names(topTables_DE_pos_4hrs_vs_0hrs)
+
+gsea_signif = lapply(fgsea_genelist, function(x){
+  x = x[x$pval < 1,]
+  x <- x[x$size >= 10,]
+  new_pathway = sapply(strsplit(x$pathway, split = '_'), function(y){
+    y = y[-1]
+    out = paste(y, collapse = ' ')
+  })
+  x$pathway2 = new_pathway
+  x = x[order(x$NES, decreasing = T),]
+})
+
+#combine cell types
+combined_fgsea = lapply(gsea_signif, function(x){
+  xlist = x[order(x$NES, decreasing = T),]
+  xlist$pathway3 = gsub('_', ' ', xlist$pathway)
+  xlist$pathway3 = str_wrap(xlist$pathway3, 50)
+  xlist$pathway3 = factor(xlist$pathway3, levels = rev(unique(xlist$pathway3)))
+  xlist$status = cut(xlist$NES, breaks = c(-Inf, 0, Inf), 
+                     labels  = c('Down-reg', 'Up-reg'))
+  return(xlist)
+})
+
+combined_fgsea = bind_rows(combined_fgsea, .id = 'cell_type')
+
+plotdat_hivpos <- combined_fgsea[grep("mitochond|ATP|fatty|oxidative|NADH|TCA|electron|lipid|cytokine|interleukin|TNF", combined_fgsea$pathway3, ignore.case = T),]
+plotdat_hivpos$pathway3 <- as.character(plotdat_hivpos$pathway3)
+pathorder <- c(grep("interleukin|cytokine",unique(plotdat_hivpos$pathway3), invert = T, value = T, ignore.case = T), grep("interleukin|cytokine",unique(plotdat_hivpos$pathway3), invert = F, value = T, ignore.case = T))
+plotdat_hivpos$pathway3 <- factor(plotdat_hivpos$pathway3, levels = rev(pathorder))
+plotdat_hivpos$cell_type <- factor(plotdat_hivpos$cell_type, levels = c("AM", "MDM", "Neutrophils", "DC", "Monocyte", "CD4 T cell", "CD8 T cell", "Tgd", "T reg", "B cell", "NK cell", "Epithelial cells"))
+plotdat_hivpos$group <- "HIV(+)"
+plotdat_hivpos$neglog10pval <- -log10(plotdat_hivpos$pval)
+ggplot(plotdat_hivpos, aes(x = cell_type, y = pathway3, color = NES)) +
+    geom_point(aes(size = size)) +
+    xlab("") +
+    theme_Publication() + 
+    scale_color_gradient2(low = '#2166ac', high = '#b2182b') +
+    scale_size(range = c(1, 8), breaks = c(0, 50, 100, 200, 300, 400)) +
+    theme(axis.text.x = element_text(size = 10, angle = 90, vjust = 0.5, hjust = 1),
+          axis.text.y = element_text(size = 10),
+          axis.title.y = element_blank(),
+          plot.title = element_text(size = 12, face = 'bold', hjust = 0.5,
+                                    vjust = 1),
+          legend.position = 'right',
+          legend.direction = 'vertical')
+```
+
+```{r}
+plotdat_hivneg$group <- "HC"
+plotdat_hivpos$group <- "PLWH"
+plotdat <- rbind(plotdat_hivneg, plotdat_hivpos)
+plotdat$neglog10pval <- -log10(plotdat$pval)
+plotdat$pathway3 <- as.character(plotdat$pathway3)
+plotdat <- plotdat[plotdat$pathway %in% c("HALLMARK_TNFA_SIGNALING_VIA_NFKB", "REACTOME_INTERLEUKIN_4_AND_INTERLEUKIN_13_SIGNALING", "KEGG_CYTOKINE_CYTOKINE_RECEPTOR_INTERACTION", "GOBP_CELLULAR_RESPONSE_TO_INTERLEUKIN_1", "REACTOME_INTERLEUKIN_7_SIGNALING" ,"GOBP_RESPONSE_TO_INTERLEUKIN_17"),]
+#pathorder <- c(grep("interleukin|cytokine",unique(plotdat$pathway3), invert = T, value = T, ignore.case = T), grep("interleukin|cytokine",unique(plotdat$pathway3), invert = F, value = T, ignore.case = T))
+plotdat$pathway3 <- str_wrap(plotdat$pathway3, width = 20)
+plotdat$pathway3 <- factor(plotdat$pathway3, levels = rev(c("HALLMARK TNFA\nSIGNALING VIA NFKB", "REACTOME INTERLEUKIN\n4 AND INTERLEUKIN 13\nSIGNALING", "KEGG CYTOKINE\nCYTOKINE RECEPTOR\nINTERACTION", "GOBP CELLULAR\nRESPONSE TO\nINTERLEUKIN 1" , "REACTOME INTERLEUKIN\n7 SIGNALING", "GOBP RESPONSE TO\nINTERLEUKIN 17")))
+plotdat <- plotdat[plotdat$cell_type %in% c("AM", "MDM", "DC", "Monocyte", "CD4 T cell", "CD8 T cell"),]
+plotdat$cell_type <- factor(plotdat$cell_type, levels = c("AM", "MDM", "DC", "Monocyte", "CD4 T cell", "CD8 T cell"))
+ggplot(plotdat, aes(x = group, y = pathway3, color = NES)) +
+    geom_point(aes(size = neglog10pval)) + facet_wrap(.~cell_type, nrow = 1) +
+    xlab("") +
+    theme_Publication() + 
+    scale_color_gradient2(low = '#2166ac', high = '#b2182b') +
+    scale_size(range = c(4, 8)) +
+    theme(axis.text.x = element_text(size = 10, angle = 90, vjust = 0.5, hjust = 1),
+          axis.text.y = element_text(size = 10),
+          axis.title.y = element_blank(),
+          plot.title = element_text(size = 12, face = 'bold', hjust = 0.5,
+                                    vjust = 1),
+          legend.position = 'right',
+          legend.direction = 'vertical')
+ggsave("Manuscript_bioxiv/Figures/dump/gsea_hiv_pos_neg_4hr_vs_0hrs_neglog_filtered.pdf", width = 7, height = 5.5, limitsize = F, units = "in")
+ggsave("Manuscript_bioxiv/Figures/dump/gsea_hiv_pos_neg_4hr_vs_0hrs_neglog.pdf", width = 15, height = 100, limitsize = F, units = "in")
+```
+
+```{r}
+object_list <- readRDS("rds_data/cellchat_objectlist_hiv_pos_neg_4hrs.rds")
+
+cellchat_hivneg4hrs <- object_list[[1]]
+cellchat_hivpos4hrs <- object_list[[2]]
+
+cellchat <- readRDS("rds_data/cellchat_object_merged.rds")
+
+cellchat_hivneg4hrs <- object_list[[1]]
+cellchat_hivpos4hrs <- object_list[[2]]
+
+cellchat <- mergeCellChat(object_list, add.names = c("HIV(-) 4hrs", "HIV(+) 4hrs"))
+
+pdf("Manuscript_bioxiv/Figures/dump/cellchat_hivpos.pdf", width = 6, height = 10)
+rankNet(cellchat, mode = "comparison", comparison = c(1,2), stacked = T, do.stat = F, color.use = c("#e41a1c", "#4daf4a")) + scale_y_continuous(expand = c(0,0)) +
+  theme(legend.position = "bottom", 
+        legend.direction = "horizontal",
+        legend.margin=margin(0,0,0,0),
+        legend.box.margin=margin(-10,-10,-10,-10),
+        axis.text.x = element_text(size = 11))
+dev.off()
+
+pdf("Manuscript_bioxiv/Figures/dump/cellchat_hivneg.pdf", width = 6, height = 10)
+rankNet(cellchat, mode = "comparison", comparison = c(3,4), stacked = T, do.stat = F, color.use = c("#e41a1c", "#4daf4a")) + scale_y_continuous(expand = c(0,0)) +
+  theme(legend.position = "bottom", 
+        legend.direction = "horizontal",
+        legend.margin=margin(0,0,0,0),
+        legend.box.margin=margin(-10,-10,-10,-10),
+        axis.text.x = element_text(size = 11))
+dev.off()
+
+pdf("Manuscript_bioxiv/Figures/dump/cellchat_hivposneg0hr.pdf", width = 6, height = 3)
+rankNet(cellchat, mode = "comparison", comparison = c(1,3), stacked = T, do.stat = T, color.use = c("#e41a1c", "#4daf4a"), signaling = c("TNF", "BAFF", "APRIL", "LIGHT")) + scale_y_continuous(expand = c(0,0)) +
+  theme(legend.position = "bottom", 
+        legend.direction = "horizontal",
+        legend.margin=margin(0,0,0,0),
+        legend.box.margin=margin(-10,-10,-10,-10),
+        axis.text.x = element_text(size = 11))
+dev.off()
+
+pdf("~/OneDrive - Emory University/pbajpai/KIT/Kit_10x/RFA Innate 2023/cellchat_network_cd86_hivneg4hrs.pdf", width = 6, height = 6)
+netVisual_aggregate(cellchat_hivneg4hrs, signaling = "CD86", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.8, vertex.label.cex = 1)
+dev.off()
+
+netVisual_aggregate(cellchat_hivpos4hrs, signaling = "SPP1", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.8, vertex.label.cex = 1)
+```
+
+#AM subset
+```{r}
+am <- subset(balVer2, subset = label.main2 == "AM")
+
+am <- FindVariableFeatures(am, verbose = F)
+am <- ScaleData(am, verbose = F)
+am <- NormalizeData(am,  verbose = F)
+am <- RunPCA(am, verbose = F, npcs = 20)
+#ElbowPlot(am)
+am <- RunUMAP(am, dims = 1:15, verbose = F)
+am <- FindNeighbors(am, dims = 1:15)
+am <- FindClusters(am, resolution = 0.05)
+
+#label am subsets
+label.subset <- am@meta.data %>%
+  select(seurat_clusters) %>%
+  mutate(label.subset = ifelse(seurat_clusters == 1, "AM 1", ifelse(seurat_clusters == 2, "AM 2", ifelse(seurat_clusters == 0, "AM 3", ifelse(seurat_clusters == 3, "AM 4", "AM 5"))))) %>%
+  select(label.subset)
+label.subset$label.subset <- factor(label.subset$label.subset, 
+                                    levels = c("AM 1", "AM 2", "AM 3", "AM 4", "AM 5"))
+
+am <- AddMetaData(am, metadata = label.subset)
+Idents(am) <- "label.subset"
+
+DimPlot(am, group.by = "label.subset", cols = cols)
+
+FeaturePlot(am, features = c("IL1A", "IL1B", "TNF"), split.by = "hiv_timepoint")
+
+topmarkersPercluster <- lapply(unique(am$label.subset), function(x){
+  message(paste("running subset:", x, sep = ""))
+  cluster_marker <- FindMarkers(am, ident.1 = x, min.pct = 0.1, only.pos = T)
+  cluster_marker <- cluster_marker %>% rownames_to_column("GeneID")
+})
+#names(topmarkersPercluster) <- paste("Cluster",unique(am$label.subset))
+names(topmarkersPercluster) <- unique(am$label.subset)
+topmarkersPercluster <- lapply(topmarkersPercluster, function(x){
+  out <- x[abs(x$avg_log2FC) >= 0.378 & x$p_val_adj <= 0.05,]
+  out <- out[order(out$avg_log2FC, decreasing = T),]
+})
+topmarkersPercluster <- topmarkersPercluster[c("AM 1", "AM 2", "AM 3", "AM 4", "AM 5")]
+
+write_xlsx(topmarkersPercluster,"Manuscript_bioxiv/suppliment/AM_subset_marker_genes.xlsx")
+
+amsubsets <- levels(am$label.subset)
+pathway_AM <- sapply(amsubsets, function(x){
+  out <- topmarkersPercluster[[x]]
+  entrez_genes <- mapIds(org.Hs.eg.db, keys = out$GeneID, column = "ENTREZID", keytype = "SYMBOL")
+  AM_path <- enrichPathway(gene = entrez_genes)
+  AM_path <- AM_path@result
+  AM_path <- AM_path[AM_path$p.adjust <= 0.05,]
+}, simplify = F, USE.NAMES = T)
+
+write_xlsx(pathway_AM,"Manuscript_bioxiv/suppliment/AM_subset_marker_genes_pathwayenrich.xlsx")
+```
+
+```{r}
+goi <- sapply(topmarkersPercluster, function(x)x$GeneID)
+goi <- unique(unlist(goi))
+
+DoHeatmap(am, features = goi, group.by = "label.subset", slot = "data", group.colors = c("#7fc97f", "#beaed4", "#fdc086", "#bf5b17", "#386cb0")) + theme(axis.text.y = element_blank())
+ggsave("Manuscript_bioxiv/Figures/dump/heatmap_AMsubsets.png", width = 5, height = 8, units = "in")
+
+```
+
+# AM1 vs AM3 comparison
+```{r}
+topTables_AM1_vs_AM3 <- FindMarkers(am, ident.1 = "AM 1", ident.2 = "AM 3", min.pct = 0.1, only.pos = T)
+topTables_AM1_vs_AM3 <- topTables_AM1_vs_AM3 %>% rownames_to_column("GeneID")
+topTables_AM1_vs_AM3 <- topTables_AM1_vs_AM3[abs(topTables_AM1_vs_AM3$avg_log2FC) >= 0.378 & topTables_AM1_vs_AM3$p_val_adj <= 0.05,]
+
+toptable_AM1_hiv_vs_hc <- subset(am, subset = label.subset == "AM 1")
+Idents(toptable_AM1_hiv_vs_hc) <- "hiv_timepoint"
+toptable_AM1_hiv_vs_hc <- FindMarkers(toptable_AM1_hiv_vs_hc, ident.1 = "HC+Mtb", ident.2 = "PLWH+Mtb", min.pct = 0.1, only.pos = T)
+toptable_AM1_hiv_vs_hc <- toptable_AM1_hiv_vs_hc %>% rownames_to_column("GeneID")
+toptable_AM1_hiv_vs_hc <- toptable_AM1_hiv_vs_hc[abs(toptable_AM1_hiv_vs_hc$avg_log2FC) >= 0.378 & toptable_AM1_hiv_vs_hc$p_val_adj <= 0.05,]
+
+sort(intersect(topTables_AM1_vs_AM3$GeneID, toptable_AM1_hiv_vs_hc$GeneID))
+```
+
+```{r}
+features <- c("TNF", "IL6", "IL1B", "IRF7", "JUN", "SOD2", "TNFAIP6", "TNFSF9", "IL1B", "IL18", "IL17A", "IL17B", "IL23A", "CCL3", "CXCL2", "CXCL3")
+
+plotdat <- subset(am, subset = hiv_timepoint %in% c("HC+Mtb", "PLWH+Mtb"))
+plotdat <- subset(plotdat, subset = label.subset == "AM 1")
+plotdat$hiv_timepoint <- as.character(plotdat$hiv_timepoint)
+
+DoHeatmap(plotdat, features = features, group.by = "hiv_timepoint", slot = "scale.data", angle = 0, group.colors = c("#b2df8a", "#ff7f00"), vjust = 0.2, hjust = 0.5, group.bar.height = 0.05) + scale_fill_gradient2(high = "red", low = "blue", mid = "white", midpoint = 0)
+#  scale_fill_gradient(low = "white", high = "red")
+ggsave("Manuscript_bioxiv/Figures/dump/doheatmap_am1_topgenes.png", width = 6, height = 5, units = "in")
+
+
+library(ComplexHeatmap)
+
+mat <- AverageExpression(plotdat, group.by = "hiv_timepoint", return.seurat = F, slot = "counts")[[1]] %>% as.matrix()
+
+mat <- mat[features,]
+
+#remove genes with zero expression
+mat <- t(scale(t(mat)))
+range(mat)
+#cluster_anno <- factor(colnames(mat), levels = colnames(mat))
+col_fun = circlize::colorRamp2(c(-1, 0, 1), c("blue", "white", "red"))
+cols <- c('#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4', '#46f0f0', '#f032e6', '#bcf60c', '#008080', '#e6beff', '#9a6324', '#800000', '#aaffc3', '#808080')
+cols <- c('#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4', '#46f0f0', '#f032e6', '#bcf60c', '#008080', '#e6beff', '#9a6324')
+anno_df <- data.frame(label = colnames(mat), 
+                     Cells = gsub("-.*", "", colnames(mat)),
+                     Group = gsub(".*-", "", colnames(mat)))
+anno_df$Cells <- paste(as.character(rep(1:12, each = 2)), anno_df$Cells, sep = "-")
+#anno_df <- anno_df %>% arrange(cells, desc(group))
+#cluster_anno <- factor(unique(anno_df$cells), levels = unique(anno_df$cells))
+
+anno_df$Cells <- factor(anno_df$Cells, levels = unique(anno_df$Cells))
+anno_df$Group <- factor(anno_df$Group, levels = c("WT Mtb", "hip1 Mut"))
+
+colcells <- cols
+names(colcells) <- unique(anno_df$Cells)
+colcells <- factor(colcells, levels = cols)
+
+rowclust = hclust(dist(mat), method = 'ward.D2')
+
+pdf("Manuscript/Figures/dump/global_dendogram.pdf", width = 60, height = 20)
+plot(as.dendrogram(rowclust))
+dev.off()
+
+test <- cutree(rowclust, h = 30)
+test <- test[test == 1]
+test <- unique(names(test))
+mat1 <- mat[test,]
+
+ha = HeatmapAnnotation(df = anno_df[,2:3], col = list(Cells = colcells, Group = c("WT Mtb" = "#808000", "hip1 Mut" = "#000075")), annotation_name_side = "left", annotation_legend_param = list(labels_gp = gpar(fontsize = 14), title_gp = gpar(fontsize = 16, fontface = "bold")))
+
+colnames(mat) <- gsub("-.*", "", colnames(mat))
+
+pdf("Manuscript-2024/Figures-2024/PB-Analysis Monthly 2024/global_heatmap_withendo.pdf", width = 14, height = 13)
+Heatmap(mat, name = "Expression",  
+        #column_split = rep(1:12, each = 2),
+        row_split = NULL,
+        cluster_columns = FALSE,
+        show_column_dend = FALSE,
+        cluster_column_slices = FALSE,
+        column_title_gp = gpar(fontsize = 16),
+        column_gap = unit(1, "mm"),
+        cluster_rows = F,
+        show_row_dend = T,
+        clustering_method_rows = "ward.D2",
+        col = col_fun,
+        row_names_gp = gpar(fontsize = 16),
+        column_title_rot = 0,
+        heatmap_legend_param = list(labels_gp = gpar(fontsize = 14), title_gp = gpar(fontsize = 16, fontface = "bold")),
+        #top_annotation = ha,
+        show_column_names = F,
+        show_row_names = T,
+        use_raster = FALSE,
+        raster_quality = 4)
+```
+
+```{r}
+all_gene_sets = msigdbr(species = "Homo sapiens")
+gene_subcats = sapply(all_gene_sets$gs_name, function(x){
+  out = gsub('_.*', '', x)
+  out = gsub('(GSE).*', '\\1', out)
+}, USE.NAMES = F)
+
+filtered_gene_sets <- all_gene_sets[grep("oxidative|reactive", all_gene_sets$gs_name, ignore.case = T),]
+filtered_gene_sets <- all_gene_sets[which(gene_subcats %in% c("GOBP", "GOMF", "REACTOME", "KEGG", "HALLMARK")),]
+filtered_gene_sets <- all_gene_sets[all_gene_sets$gs_name %in% c("HALLMARK_TNFA_SIGNALING_VIA_NFKB", "REACTOME_TNFR2_NON_CANONICAL_NF_KB_PATHWAY", "REACTOME_INTERLEUKIN_1_SIGNALING", "REACTOME_INTERLEUKIN_4_AND_INTERLEUKIN_13_SIGNALING", "REACTOME_MITOCHONDRIAL_BIOGENESIS"),]
+
+msigdbr_list = split(x = filtered_gene_sets$gene_symbol, f = filtered_gene_sets$gs_name)
+
+topmarkersPercluster <-list(topTables_AM1_vs_AM3)
+fgsea_genelist = lapply(seq_along(topmarkersPercluster), function(i){
+  x = topmarkersPercluster[[i]]
+  print(names(topmarkersPercluster)[i])
+  minx <- x[x$p_val != 0,]
+  x$p_val[x$p_val == 0] <- min(minx$p_val)
+  preranked = x %>%
+    #mutate_at(2:6,~replace(., . == 0, min(.[.>0], na.rm = TRUE))) %>%
+    mutate(logp = -log10(p_val) * sign(avg_log2FC)) %>%
+    #filter(!grepl('Mt-', GeneID)) %>%
+    arrange(logp)
+  rankset = setNames(preranked$logp, preranked$GeneID)
+  fgsea_out = fgsea(pathways = msigdbr_list, stats = rankset)
+  fgsea_out$leadingEdge = sapply(fgsea_out$leadingEdge, function(x){
+    x = paste(x, collapse = ',')
+  })
+  fgsea_out = fgsea_out[order(fgsea_out$padj),]
+  return(fgsea_out)
+})
+names(fgsea_genelist) <- names(topmarkersPercluster)
+
+gsea_signif = lapply(fgsea_genelist, function(x){
+  x = x[x$pval <= 0.05,]
+  x <- x[x$size >= 10,]
+  new_pathway = sapply(strsplit(x$pathway, split = '_'), function(y){
+    y = y[-1]
+    out = paste(y, collapse = ' ')
+  })
+  x$pathway2 = new_pathway
+  x = x[order(x$NES, decreasing = T),]
+})
+
+#combine cell types
+combined_fgsea = lapply(gsea_signif, function(x){
+  xlist = x[order(x$NES, decreasing = T),]
+  xlist$pathway3 = gsub('_', ' ', xlist$pathway)
+  xlist$pathway3 = str_wrap(xlist$pathway3, 50)
+  xlist$pathway3 = factor(xlist$pathway3, levels = rev(unique(xlist$pathway3)))
+  xlist$status = cut(xlist$NES, breaks = c(-Inf, 0, Inf), 
+                     labels  = c('Down-reg', 'Up-reg'))
+  return(xlist)
+})
+
+combined_fgsea = bind_rows(combined_fgsea, .id = "cluster")
+
+plotdat <- combined_fgsea
+#plotdat <- combined_fgsea[grep("mitochond|ATP|oxidative|NADH|TCA|electron|cytokine|interleukin|TNF", combined_fgsea$pathway3, ignore.case = T),]
+plotdat$pathway3 <- as.character(plotdat$pathway3)
+#pathorder <- c(grep("interleukin|cytokine",unique(plotdat$pathway3), invert = T, value = T, ignore.case = T), grep("interleukin|cytokine",unique(plotdat$pathway3), invert = F, value = T, ignore.case = T))
+plotdat$pathway3 <- factor(plotdat$pathway3, levels = rev(unique(plotdat$pathway3)))
+plotdat$neglog10pval <- -log10(plotdat$pval)
+plotdat$group <- ifelse(plotdat$NES > 0, "Upreg", "Downreg")
+
+ggplot(plotdat, aes(x = NES, y = pathway3, fill = group)) + geom_bar(stat = "identity") + scale_fill_manual(values = c("#2166ac", "#b2182b")) + scale_y_discrete(position = "right") + theme_Publication() + theme(axis.text.x = element_text(size = 10), axis.text.y = element_text(size = 10), axis.title.y = element_blank(), legend.position = "none")
+
+ggplot(plotdat, aes(x = cluster, y = pathway3, color = NES)) +
+    geom_point(aes(size = size)) +
+    xlab("") +
+    theme_Publication() + 
+    scale_color_gradient2(low = '#2166ac', high = '#b2182b') +
+    scale_size(range = c(2, 6)) +
+    theme(axis.text.x = element_text(size = 10, angle = 90, vjust = 0.5, hjust = 1),
+          axis.text.y = element_text(size = 10),
+          axis.title.y = element_blank(),
+          plot.title = element_text(size = 12, face = 'bold', hjust = 0.5,
+                                    vjust = 1),
+          legend.position = 'right',
+          legend.direction = 'vertical')
+
+ggplot(plotdat, aes(x = "AM1 vs AM3", y = pathway3, color = NES)) +
+    geom_point(aes(size = neglog10pval)) +
+    xlab("") +
+    theme_Publication() + 
+    scale_color_gradient2(low = '#2166ac', high = '#b2182b') +
+    scale_size(range = c(1, 6)) +
+    theme(axis.text.x = element_text(size = 10),
+          axis.text.y = element_text(size = 10),
+          axis.title.y = element_blank(),
+          plot.title = element_text(size = 12, face = 'bold', hjust = 0.5,
+                                    vjust = 1),
+          legend.position = 'right',
+          legend.direction = 'vertical')
+
+ggsave("Manuscript_bioxiv/Figures/dump/gsea_am1_vs_am3_fil.pdf", width = 8, height = 3.5, units = "in")
+```
+
+```{r}
+#Trajectory
+library(monocle3)
+library(SeuratWrappers)
+
+am_cds <- as.cell_data_set(am)
+am_cds <- cluster_cells(cds = am_cds, reduction_method = "UMAP", 
+                       cluster_method = "louvain", k = 20)
+num_clust <- clusters(am_cds)
+table(num_clust)
+am_cds <- learn_graph(am_cds, close_loop = F, learn_graph_control = list(minimal_branch_len = 30, geodesic_distance_ratio = 0.6, prune_graph = T))
+
+plot_cells(am_cds, color_cells_by = "cluster", label_groups_by_cluster = FALSE,  label_branch_points = F, label_roots = F, label_leaves = F, group_label_size = 5)
+
+#set cluster 1 which contains present at 0hrs as the root
+am_cds <- order_cells(am_cds, reduction_method = "UMAP", root_cells = colnames(am_cds[, clusters(am_cds) == 1]))
+
+plotdat = am_cds
+
+plot_cells(cds = plotdat, color_cells_by = "pseudotime", show_trajectory_graph = TRUE, cell_size = 1, trajectory_graph_color = "black", trajectory_graph_segment_size = 1, label_roots = F, label_leaves = F, label_branch_points = F) 
+#+ facet_wrap(.~hiv_timepoint, nrow = 2, scales = "free")
+
+ggsave("Manuscript_bioxiv/Figures/dump/pseudotime_am.pdf", width = 10, height = 10, units = "in")
+ggsave("Manuscript_bioxiv/Figures/dump/pseudotime_am_combined.png", width = 5.5, height = 5, units = "in")
+```
+
+# Trajectory heatmap
+```{r}
+library(tradeSeq)
+library(monocle3)
+library(data.table)
+library(reticulate)
+library(slingshot)
+library(pheatmap)
+
+goi <- sapply(topmarkersPercluster, function(x)x$GeneID, USE.NAMES = F)
+goi <- unname(unlist(goi))
+goi <- unique(goi)
+
+all_gene_sets = msigdbr(species = "Homo sapiens")
+
+goi <- all_gene_sets[all_gene_sets$gs_name == "HALLMARK_TNFA_SIGNALING_VIA_NFKB",]
+goi <- all_gene_sets[all_gene_sets$gs_name == "HALLMARK_IL6_JAK_STAT3_SIGNALING",]
+goi <- all_gene_sets[all_gene_sets$gs_name == "REACTOME_INTERLEUKIN_17_SIGNALING",]
+goi <- all_gene_sets[all_gene_sets$gs_name == "REACTOME_INTERLEUKIN_1_FAMILY_SIGNALING",]
+
+goi <- unique(goi$gene_symbol)
+
+am_fil <- subset(am, subset = hiv_timepoint %in% c("HC+Mtb", "PLWH+Mtb"))
+
+DimPlot(am, group.by = "label.subset", cols = cols)
+```
+
+```{r}
+am_sce <- as.SingleCellExperiment(am)
+am_sce <- slingshot(am_sce, reducedDim = 'UMAP', clusterLabels = colData(am_sce)$label.subset, start.clus = 'AM 1', approx_points = 150)
+
+#colnames(colData(am_sce))
+#slingPseudotime_1 slingPseudotime_2
+singleCellTK::plotUMAP(am_sce, colorBy = "slingPseudotime_2")
+#am_sce$slingPseudotime_2 <- NULL
+#ks.test(slingPseudotime(am_sce)[colData(am_sce)$hiv_timepoint == "HC+Mtb", 1], slingPseudotime(am_sce)[colData(am_sce)$hiv_timepoint == "PLWH+Mtb", 1])
+
+set.seed(3)
+am_sce <- fitGAM(am_sce, conditions = factor(colData(am_sce)$hiv_timepoint), nknots = 5, genes = goi)
+```
+
+```{r}
+#plotSmoothers(am_sce, assays(am_sce)$counts, gene = "TNF", alpha = 1, border = TRUE) + ggtitle("TNF")
+condRes <- conditionTest(am_sce, l2fc = log2(1.3))
+condRes$padj <- p.adjust(condRes$pvalue, "fdr")
+conditionGenes <- rownames(condRes)[condRes$pvalue <= 0.05]
+conditionGenes <- conditionGenes[!is.na(conditionGenes)]
+#conditionGenes <- c(conditionGenes, "TNF")
+
+yhatSmooth <- predictSmooth(am_sce, gene = conditionGenes, nPoints = 150, tidy = F)
+yhatSmooth <- yhatSmooth[,grep("lineage1", colnames(yhatSmooth))]
+yhatSmoothScaled <- t(scale(t(yhatSmooth)))
+```
+
+```{r}
+paletteLength <- 500
+myColor <- colorRampPalette(c("blue", "white", "red"))(paletteLength)
+# length(breaks) == length(paletteLength) + 1
+# use floor and ceiling to deal with even/odd length pallettelengths
+myBreaks <- c(seq(min(yhatSmoothScaled), 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(max(yhatSmoothScaled)/paletteLength, max(yhatSmoothScaled), length.out=floor(paletteLength/2)))
+
+
+heatSmooth_hivneg4hr <- pheatmap(yhatSmoothScaled[, 1:150], cluster_cols = FALSE, show_rownames = F, show_colnames = FALSE, main = "HC+Mtb", legend = FALSE, silent = F, color = myColor, breaks = myBreaks, border_color = NA)
+
+matchingHeatmap_hiv4hr <- pheatmap(yhatSmoothScaled[heatSmooth_hivneg4hr$tree_row$order, 151:300], cluster_cols = FALSE, cluster_rows = FALSE, show_rownames = T, show_colnames = FALSE, main = "PLWH+Mtb", legend = F, silent = F, color = myColor, breaks = myBreaks, border_color = NA)
+
+png("Manuscript_bioxiv/Figures/dump/pseudotime_tnfsignaling3.png", width = 10, height = 5, units = "in", res = 600)
+gridExtra::grid.arrange(heatSmooth_hivneg4hr[[4]], matchingHeatmap_hiv4hr[[4]], ncol = 2, widths = c(3.9/8, 4.1/8))
+dev.off()
+
+plotdat <- subset(am, subset = label.subset != "AM 5")
+plotdat$label.subset <- factor(plotdat$label.subset, levels = c("AM 2", "AM 3", "AM 1", "AM 4"))
+DoHeatmap(plotdat, group.by = "label.subset", features = "TNF", angle = 0, hjust = 0.5, vjust = 0.08, group.bar.height = 0.06)
+ggsave("Manuscript_bioxiv/Figures/dump/amsubset_bars.pdf", width = 8, height = 3, units = "in")
+```
+
+```{r}
+
+```
+
+
+```{r}
+library(ReactomePA)
+library(ggbeeswarm)
+library(ggrepel)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+
+entrez_genes <-lapply(topmarkersPercluster, function(x){
+   out <- mapIds(org.Hs.eg.db, keys = x$GeneID, column = "ENTREZID", keytype = "SYMBOL")
+})
+pathway_cluster <- lapply(entrez_genes, function(x){
+  out <- enrichPathway(gene = x)
+  out <- out@result
+  out <- out[out$p.adjust <= 0.05,]
+})
+
+plotdat <- bind_rows(pathway_cluster, .id = "Cluster ID")
+plotdat$`Cluster ID` <- gsub("Cluster ", "", plotdat$`Cluster ID`)
+plotdat$neglogfdr <- -log10(plotdat$p.adjust)
+
+ggplot(plotdat, aes(x = `Cluster ID`, y = Description, color = neglogfdr)) + geom_point(aes(size = neglogfdr)) + scale_color_gradient2(low = "#fcbba1", mid = "#fb6a4a", high = "#cb181d")
+ggsave("Manuscript_bioxiv/Figures/dump/pathway_enrich_amclusters.pdf", width = 15, height = 100, limitsize = F, units = "in")
+
+all_gene_sets = msigdbr(species = "Homo sapiens")
+gene_subcats = sapply(all_gene_sets$gs_name, function(x){
+  out = gsub('_.*', '', x)
+  out = gsub('(GSE).*', '\\1', out)
+}, USE.NAMES = F)
+
+filtered_gene_sets <- all_gene_sets[which(gene_subcats %in% c("GOBP", "GOMF", "REACTOME", "KEGG", "HALLMARK")),]
+filtered_gene_sets <- all_gene_sets[all_gene_sets$gs_name %in% c("GOBP_REGULATION_OF_MITOCHONDRIAL_MEMBRANE_POTENTIAL", "GOBP_RESPIRATORY_ELECTRON_TRANSPORT_CHAIN", "HALLMARK_TNFA_SIGNALING_VIA_NFKB", "GOBP_INTERLEUKIN_6_PRODUCTION", "REACTOME_INTERLEUKIN_4_AND_INTERLEUKIN_13_SIGNALING", "REACTOME_INTERLEUKIN_17_SIGNALING"),]
+
+msigdbr_list = split(x = filtered_gene_sets$gene_symbol, f = filtered_gene_sets$gs_name)
+
+fgsea_genelist = lapply(seq_along(topmarkersPercluster), function(i){
+  x = topmarkersPercluster[[i]]
+  print(names(topmarkersPercluster)[i])
+  minx <- x[x$p_val != 0,]
+  x$p_val[x$p_val == 0] <- min(minx$p_val)
+  preranked = x %>%
+    #mutate_at(2:6,~replace(., . == 0, min(.[.>0], na.rm = TRUE))) %>%
+    mutate(logp = -log10(p_val) * sign(avg_log2FC)) %>%
+    #filter(!grepl('Mt-', GeneID)) %>%
+    arrange(logp)
+  rankset = setNames(preranked$logp, preranked$GeneID)
+  fgsea_out = fgsea(pathways = msigdbr_list, stats = rankset)
+  fgsea_out$leadingEdge = sapply(fgsea_out$leadingEdge, function(x){
+    x = paste(x, collapse = ',')
+  })
+  fgsea_out = fgsea_out[order(fgsea_out$padj),]
+  return(fgsea_out)
+})
+names(fgsea_genelist) = names(topmarkersPercluster)
+
+gsea_signif = lapply(fgsea_genelist, function(x){
+  #x = x[x$pval <= 0.05,]
+  #x <- x[x$size >= 10,]
+  new_pathway = sapply(strsplit(x$pathway, split = '_'), function(y){
+    y = y[-1]
+    out = paste(y, collapse = ' ')
+  })
+  x$pathway2 = new_pathway
+  x = x[order(x$NES, decreasing = T),]
+})
+
+#combine cell types
+combined_fgsea = lapply(gsea_signif, function(x){
+  xlist = x[order(x$NES, decreasing = T),]
+  xlist$pathway3 = gsub('_', ' ', xlist$pathway)
+  xlist$pathway3 = str_wrap(xlist$pathway3, 50)
+  xlist$pathway3 = factor(xlist$pathway3, levels = rev(unique(xlist$pathway3)))
+  xlist$status = cut(xlist$NES, breaks = c(-Inf, 0, Inf), 
+                     labels  = c('Down-reg', 'Up-reg'))
+  return(xlist)
+})
+
+combined_fgsea = bind_rows(combined_fgsea, .id = 'Cluster_ID')
+
+plotdat <- combined_fgsea
+plotdat <- combined_fgsea[grep("mitochond|ATP|oxidative|NADH|TCA|electron|cytokine|interleukin|TNF", combined_fgsea$pathway3, ignore.case = T),]
+plotdat$pathway3 <- as.character(plotdat$pathway3)
+pathorder <- c(grep("interleukin|cytokine",unique(plotdat$pathway3), invert = T, value = T, ignore.case = T), grep("interleukin|cytokine",unique(plotdat$pathway3), invert = F, value = T, ignore.case = T))
+plotdat$pathway3 <- factor(plotdat$pathway3, levels = rev(pathorder))
+plotdat$neglog10pval <- -log10(plotdat$pval)
+
+#plotdat$pathway3 <- factor(plotdat$pathway3, levels = rev(c("GOBP LIPID LOCALIZATION", "GOBP RESPONSE TO LIPID", "GOBP RESPONSE TO OXIDATIVE STRESS", "REACTOME FATTY ACID METABOLISM", "REACTOME MITOCHONDRIAL FATTY ACID BETA OXIDATION", "GOBP OXIDATIVE PHOSPHORYLATION", "GOBP ATP METABOLIC PROCESS", "GOMF ELECTRON TRANSFER ACTIVITY", "GOBP MITOCHONDRIAL RESPIRATORY CHAIN COMPLEX\nASSEMBLY", "GOBP RESPONSE TO CYTOKINE")))
+plotdat$Cluster_ID <- gsub("Cluster ", "", plotdat$Cluster_ID)
+ggplot(plotdat, aes(x = Cluster_ID, y = pathway3, color = NES)) +
+    geom_point(aes(size = neglog10pval)) +
+    xlab("") +
+    theme_Publication() + 
+    scale_color_gradient2(low = '#2166ac', high = '#b2182b') +
+    scale_size(range = c(2, 6)) +
+    theme(axis.text.x = element_text(size = 10, angle = 90, vjust = 0.5, hjust = 1),
+          axis.text.y = element_text(size = 10),
+          axis.title.y = element_blank(),
+          plot.title = element_text(size = 12, face = 'bold', hjust = 0.5,
+                                    vjust = 1),
+          legend.position = 'right',
+          legend.direction = 'vertical')
+
+ggsave("Manuscript_bioxiv/Figures/dump/gsea_amclusters_fil.pdf", width = 7, height = 3, limitsize = F, units = "in")
+```
+
+# Pathway scoring
+```{r}
+library(SiPSiC)
+all_gene_sets <- msigdbr(species = "Homo sapiens")
+
+tnfgenes <- all_gene_sets[all_gene_sets$gs_name == "HALLMARK_TNFA_SIGNALING_VIA_NFKB",]
+
+am_sce <- as.SingleCellExperiment(am)
+
+pathwayGenesList <- unique(tnfgenes$gene_symbol)
+scoresAndIndices <- getPathwayScores(counts(am_sce), pathwayGenesList)
+pathwayScoresOfCells <- scoresAndIndices$pathwayScores
+#pathwayGeneIndices <- scoresAndIndices$index
+pathwayScoresOfCells <- as.data.frame(pathwayScoresOfCells)
+am <- AddMetaData(am, metadata = pathwayScoresOfCells)
+
+FeaturePlot(am, features = "pathwayScoresOfCells", split.by = "hiv_timepoint") & scale_color_gradientn(colors = c("#007fff","#ff89c4", "#ff007f"), limits = c(0, 1)) 
+ggsave("Manuscript_bioxiv/Figures/dump/tnf_am_pathway_umap.png", width = 16, height = 4, units = "in")
+
+##
+am$pathwayScoresOfCells <- NULL
+inflamtory_resp <- all_gene_sets[all_gene_sets$gs_name == "HALLMARK_INFLAMMATORY_RESPONSE",]
+pathwayGenesList <- unique(inflamtory_resp$gene_symbol)
+scoresAndIndices <- getPathwayScores(counts(am_sce), pathwayGenesList)
+pathwayScoresOfCells <- data.frame("pathwayScoresOfCells" = scoresAndIndices$pathwayScores)
+am <- AddMetaData(am, metadata = pathwayScoresOfCells)
+
+FeaturePlot(am, features = "pathwayScoresOfCells", split.by = "hiv_timepoint") & scale_color_gradientn(colors = c("#007fff","#ff89c4", "#ff007f"), limits = c(0, 1)) 
+ggsave("Manuscript_bioxiv/Figures/dump/inflamRes_am_pathway_umap.png", width = 16, height = 4, units = "in")
+
+##
+am$pathwayScoresOfCells <- NULL
+il17_resp <- all_gene_sets[all_gene_sets$gs_name == "REACTOME_INTERLEUKIN_17_SIGNALING",]
+pathwayGenesList <- unique(il17_resp$gene_symbol)
+scoresAndIndices <- getPathwayScores(counts(am_sce), pathwayGenesList)
+pathwayScoresOfCells <- data.frame("pathwayScoresOfCells" = scoresAndIndices$pathwayScores)
+am <- AddMetaData(am, metadata = pathwayScoresOfCells)
+
+FeaturePlot(am, features = "pathwayScoresOfCells", split.by = "hiv_timepoint", ncol = 2) & scale_color_gradientn(colors = c("#007fff","#ff89c4", "#ff007f"), limits = c(0, 1)) 
+ggsave("Manuscript_bioxiv/Figures/dump/iL17_am_pathway_umap.png", width = 16, height = 4, units = "in")
+
+##
+am$pathwayScoresOfCells <- NULL
+il6_resp <- all_gene_sets[all_gene_sets$gs_name == "REACTOME_INTERLEUKIN_6_FAMILY_SIGNALING",]
+pathwayGenesList <- unique(il6_resp$gene_symbol)
+scoresAndIndices <- getPathwayScores(counts(am_sce), pathwayGenesList)
+pathwayScoresOfCells <- data.frame("pathwayScoresOfCells" = scoresAndIndices$pathwayScores)
+am <- AddMetaData(am, metadata = pathwayScoresOfCells)
+
+FeaturePlot(subset(am, subset = hiv_timepoint %in% c("HC+Mtb", "PLWH+Mtb")), features = "pathwayScoresOfCells", split.by = "hiv_timepoint", ncol = 2) & scale_color_gradientn(colors = c("#007fff","#ff89c4", "#ff007f"), limits = c(0, 1)) 
+ggsave("Manuscript_bioxiv/Figures/dump/iL6_am_pathway_umap.png", width = 8, height = 4, units = "in")
+
+##
+am$pathwayScoresOfCells <- NULL
+il1_resp <- all_gene_sets[all_gene_sets$gs_name == "REACTOME_INTERLEUKIN_1_FAMILY_SIGNALING",]
+pathwayGenesList <- unique(il1_resp$gene_symbol)
+scoresAndIndices <- getPathwayScores(counts(am_sce), pathwayGenesList)
+pathwayScoresOfCells <- data.frame("pathwayScoresOfCells" = scoresAndIndices$pathwayScores)
+am <- AddMetaData(am, metadata = pathwayScoresOfCells)
+
+FeaturePlot(subset(am, subset = hiv_timepoint %in% c("HC+Mtb", "PLWH+Mtb")), features = "pathwayScoresOfCells", split.by = "hiv_timepoint", ncol = 2) & scale_color_gradientn(colors = c("#007fff","#ff89c4", "#ff007f"), limits = c(0, 1)) 
+ggsave("Manuscript_bioxiv/Figures/dump/iL1_am_pathway_umap.png", width = 8, height = 4, units = "in")
+
+##
+am$pathwayScoresOfCells <- NULL
+il17_resp <- all_gene_sets[all_gene_sets$gs_name == "REACTOME_INTERLEUKIN_17_SIGNALING",]
+pathwayGenesList <- unique(il17_resp$gene_symbol)
+scoresAndIndices <- getPathwayScores(counts(am_sce), pathwayGenesList)
+pathwayScoresOfCells <- data.frame("pathwayScoresOfCells" = scoresAndIndices$pathwayScores)
+am <- AddMetaData(am, metadata = pathwayScoresOfCells)
+
+FeaturePlot(subset(am, subset = hiv_timepoint %in% c("HC+Mtb", "PLWH+Mtb")), features = "pathwayScoresOfCells", split.by = "hiv_timepoint", ncol = 2) & scale_color_gradientn(colors = c("#007fff","#ff89c4", "#ff007f"), limits = c(0, 1)) 
+ggsave("Manuscript_bioxiv/Figures/dump/iL17_am_pathway_umap.png", width = 8, height = 4, units = "in")
+
+##
+am$pathwayScoresOfCells <- NULL
+april_resp <- all_gene_sets[all_gene_sets$gs_name == "BIOCARTA_TALL1_PATHWAY",]
+pathwayGenesList <- unique(april_resp$gene_symbol)
+scoresAndIndices <- getPathwayScores(counts(am_sce), pathwayGenesList)
+pathwayScoresOfCells <- data.frame("pathwayScoresOfCells" = scoresAndIndices$pathwayScores)
+am <- AddMetaData(am, metadata = pathwayScoresOfCells)
+
+FeaturePlot(subset(am, subset = hiv_timepoint %in% c("HC+Mtb", "PLWH+Mtb")), features = "pathwayScoresOfCells", split.by = "hiv_timepoint", ncol = 2) & scale_color_gradientn(colors = c("#007fff","#ff89c4", "#ff007f"), limits = c(0, 1)) 
+ggsave("Manuscript_bioxiv/Figures/dump/tall1_april_am_pathway_umap.png", width = 8, height = 4, units = "in")
+```
+
+# Violin plots
+```{r}
+gene_voilin_pos_neg_4hrs_AM1_ver2("TNF", seurat_obj = am)
+ggsave("Manuscript_bioxiv/Figures/dump/AM1_TNF.png", width = 3.5, height = 4, units = "in")
+
+gene_voilin_pos_neg_4hrs_AM1_ver2("IL6", seurat_obj = am)
+ggsave("Manuscript_bioxiv/Figures/dump/AM1_IL6.png", width = 3.5, height = 4, units = "in")
+
+gene_voilin_pos_neg_4hrs_AM1_ver2("IL1B", seurat_obj = am)
+ggsave("Manuscript_bioxiv/Figures/dump/AM1_IL1B.png", width = 3.5, height = 4, units = "in")
+
+gene_voilin_pos_neg_4hrs_AM1_ver2("IL18", seurat_obj = am)
+ggsave("Manuscript_bioxiv/Figures/dump/AM1_IL18.png", width = 3.5, height = 4, units = "in")
+
+gene_voilin_pos_neg_4hrs_AM1_ver2("IL23A", seurat_obj = am)
+ggsave("Manuscript_bioxiv/Figures/dump/AM1_IL23A.png", width = 3.5, height = 4, units = "in")
+
+gene_voilin_pos_neg_4hrs_AM1_ver2("CD86", seurat_obj = am)
+ggsave("Manuscript_bioxiv/Figures/dump/AM1_CD86.png", width = 3.5, height = 4, units = "in")
+
+gene_voilin_pos_neg_4hrs_AM1_ver2("SOD2", seurat_obj = am)
+ggsave("Manuscript_bioxiv/Figures/dump/AM1_SOD2.png", width = 3.5, height = 4, units = "in")
+
+gene_voilin_pos_neg_4hrs_AM1("MT-ATP8", seurat_obj = am)
+ggsave("Manuscript_bioxiv/Figures/dump/AM1_Mt-ATP8.png", width = 3.5, height = 4, units = "in")
+
+gene_voilin_pos_neg_4hrs_AM1("MT-ND6", seurat_obj = am)
+ggsave("Manuscript_bioxiv/Figures/dump/AM1_Mt-ND6.png", width = 3.5, height = 4, units = "in")
+
+gene_voilin_pos_neg_4hrs_AM1("MT-ND4L", seurat_obj = am)
+ggsave("Manuscript_bioxiv/Figures/dump/AM1_MT-ND4L.png", width = 3.5, height = 4, units = "in")
+```
+
+
+T cell subset analysis
+```{r}
+library(clustree)
+library(SingleR)
+tcell <- subset(balVer2, subset = label.main == "T cells")
+
+#remove MDM contamination
+tcell <- subset(tcell, subset = label.main2 != "MDM")
+#redo normalizations and clustering 
+tcell <- FindVariableFeatures(tcell, verbose = F)
+tcell <- ScaleData(tcell, verbose = F)
+tcell <- NormalizeData(tcell,  verbose = F)
+tcell <- RunPCA(tcell, verbose = F, npcs = 20)
+#ElbowPlot(tcell)
+tcell <- RunUMAP(tcell, dims = 1:15, verbose = F)
+tcell <- FindNeighbors(tcell, dims = 1:15)
+tcell <- FindClusters(tcell, resolution = 0.5)
+
+#cluster using BlueprintEncodeData
+encode_ref <- celldex::BlueprintEncodeData()
+encode_ref <- encode_ref[, encode_ref$label.main %in% c("CD4+ T-cells", "CD8+ T-cells")]
+
+Idents(tcell) <- "RNA_snn_res.0.5"
+label.fine <- SingleR(as.SingleCellExperiment(tcell), ref = encode_ref, labels = encode_ref$label.fine, clusters = Idents(tcell))
+tcelllabels <- label.fine$labels
+names(tcelllabels) <- levels(Idents(tcell))
+tcell$encode_label <- ifelse(tcell$RNA_snn_res.0.5 %in% c(0,5), "CD4+ Tem", ifelse(tcell$RNA_snn_res.0.5 %in% c(1,3,6,9,12), "CD8+ Tcm", ifelse(tcell$RNA_snn_res.0.5 %in% c(2,4,8,11), "CD8+ Tem", "Tregs")))
+ggsave("Manuscript_bioxiv/Figures/dump/tcellencodeannotation.pdf", width = 6, height = 6, units = "in")
+#cluster using DatabaseImmuneCellExpressionData
+dice_ref <- celldex::DatabaseImmuneCellExpressionData()
+dice_ref <- dice_ref[, dice_ref$label.main %in% c("T cells, CD4+", "T cells, CD8+")]
+
+Idents(tcell) <- "RNA_snn_res.0.5"
+label.fine <- SingleR(as.SingleCellExperiment(tcell), ref = dice_ref, labels = dice_ref$label.fine, clusters = Idents(tcell))
+tcelllabels <- label.fine$labels
+names(tcelllabels) <- levels(Idents(tcell))
+#all clusters got annotated to CD4+ Th1 cells execpt Tregs
+
+#cluster using Monaco
+monaco_ref <- celldex::MonacoImmuneData()
+monaco_ref <- monaco_ref[, monaco_ref$label.main %in% c("CD4+ T cells", "CD8+ T cells")]
+
+Idents(tcell) <- "RNA_snn_res.0.5"
+label.fine <- SingleR(as.SingleCellExperiment(tcell), ref = monaco_ref, labels = monaco_ref$label.fine, clusters = Idents(tcell))
+tcelllabels <- label.fine$labels
+names(tcelllabels) <- levels(Idents(tcell))
+tcell$monaco_label <- ifelse(tcell$RNA_snn_res.0.5 %in% c(2,3,6,8,9,11,12), "Effector memory CD8", ifelse(tcell$RNA_snn_res.0.5 %in% c(0,1,4,5), "Th1/Th17 cells", "Tregs"))
+
+DimPlot(tcell, group.by = "monaco_label", cols = cols) + theme(plot.title = element_blank(), legend.position = "bottom", legend.direction = "horizontal")
+ggsave("Manuscript_bioxiv/Figures/dump/tcellmonacoannotation.pdf", width = 6, height = 6, units = "in")
+
+#cluster using reference markers
+markersheets <- read_xlsx("tcell_markers.xlsx")
+
+#cd4 Naive
+markers <- na.omit(markersheets$`CD4 Naïve`)
+
+DotPlot(tcell, features = markers, group.by = "RNA_snn_res.0.5", scale = F) +
+  xlab("") + ylab("") +
+  scale_color_gradient(high = "red", low = "blue") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+ggsave("Manuscript_bioxiv/Figures/dump/tcell_naive.pdf", width = 5, height = 4, units = "in")
+
+#Tcm 
+markers <- na.omit(markersheets$Tcm)
+markers <- c(markers, "CD4", "CD8A", "CD8B")
+
+DotPlot(tcell, features = markers, group.by = "RNA_snn_res.0.5", scale = F) +
+  xlab("") + ylab("") +
+  scale_color_gradient(high = "red", low = "blue") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+ggsave("Manuscript_bioxiv/Figures/dump/tcell_CM.pdf", width = 5, height = 4, units = "in")
+
+#CD8 Tem 
+markers <- na.omit(markersheets$`CD8 TEM`)
+markers <- markers[markers != "IFNG"]
+markers <- c(markers, "CD4", "CD8A", "CD8B")
+
+DotPlot(tcell, features = markers, group.by = "RNA_snn_res.0.5", scale = F) +
+  xlab("") + ylab("") +
+  scale_color_gradient(high = "red", low = "blue") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+ggsave("Manuscript_bioxiv/Figures/dump/tcell_CD8EM.pdf", width = 5, height = 4, units = "in")
+
+#CD8 TRM
+markers <- na.omit(markersheets$`TRM like`)
+markers <- c(markers, "CD4", "CD8A", "CD8B")
+
+DotPlot(tcell, features = markers, group.by = "RNA_snn_res.0.5", scale = F) +
+  xlab("") + ylab("") +
+  scale_color_gradient(high = "red", low = "blue") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+ggsave("Manuscript_bioxiv/Figures/dump/tcell_TRM.pdf", width = 5, height = 4, units = "in")
+
+#CD8 Effector
+markers <- na.omit(markersheets$`CD8 Eff`)
+markers <- c(markers, "CD4", "CD8A", "CD8B")
+
+DotPlot(tcell, features = markers, group.by = "RNA_snn_res.0.5", scale = F) +
+  xlab("") + ylab("") +
+  scale_color_gradient(high = "red", low = "blue") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+ggsave("Manuscript_bioxiv/Figures/dump/tcell_Effector.pdf", width = 5, height = 4, units = "in")
+
+#gamma delta
+markers <- na.omit(markersheets$gammadelta)
+markers <- c(markers, "CD4", "CD8A", "CD8B")
+
+DotPlot(tcell, features = markers, group.by = "RNA_snn_res.0.5", scale = F) +
+  xlab("") + ylab("") +
+  scale_color_gradient(high = "red", low = "blue") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+ggsave("Manuscript_bioxiv/Figures/dump/tcell_gammadelta.pdf", width = 5, height = 4, units = "in")
+
+#MAIT
+markers <- na.omit(markersheets$MAIT)
+markers <- c(markers, "CD4", "CD8A", "CD8B", "FAS")
+
+DotPlot(tcell, features = markers, group.by = "RNA_snn_res.0.5", scale = F) +
+  xlab("") + ylab("") +
+  scale_color_gradient(high = "red", low = "blue") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+ggsave("Manuscript_bioxiv/Figures/dump/mait.pdf", width = 5, height = 4, units = "in")
+
+#TH1
+markers <- na.omit(markersheets$th1)
+markers <- c(markers, "CD4", "CD8A", "CD8B")
+
+DotPlot(tcell, features = markers, group.by = "RNA_snn_res.0.5", scale = F) +
+  xlab("") + ylab("") +
+  scale_color_gradient(high = "red", low = "blue") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+ggsave("Manuscript_bioxiv/Figures/dump/th1.pdf", width = 5, height = 4, units = "in")
+
+#CD8 Exhausted
+markers <- na.omit(markersheets$`CD8 T exhausted`)
+markers <- c(markers, "CD4", "CD8A", "CD8B")
+
+DotPlot(tcell, features = markers, group.by = "RNA_snn_res.0.5", scale = F) +
+  xlab("") + ylab("") +
+  scale_color_gradient(high = "red", low = "blue") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+ggsave("Manuscript_bioxiv/Figures/dump/exhausted_cd8.pdf", width = 5, height = 4, units = "in")
+
+###final markers
+tcell$label.subset <- ifelse(tcell$RNA_snn_res.0.5 %in% c(0,4), "CD4 TEM1", ifelse(tcell$RNA_snn_res.0.5 == 1, "CD4 TEM2", ifelse(tcell$RNA_snn_res.0.5 %in% c(2,3), "CD8 TEM1", ifelse(tcell$RNA_snn_res.0.5 %in% c(6,9), "CD8 TEM2", ifelse(tcell$RNA_snn_res.0.5 %in% c(7,10), "Treg", ifelse(tcell$RNA_snn_res.0.5 == 8, "CD8 TEM GZMK-", ifelse(tcell$RNA_snn_res.0.5 == 5, "CD4 TCM", ifelse(tcell$RNA_snn_res.0.5 == 11, "CD8 TEM IFNG+", "TRM MKI67+"))))))))
+tcell$label.subset <- factor(tcell$label.subset, levels = c("CD4 TCM", "CD4 TEM1", "CD4 TEM2", "CD8 TEM1", "CD8 TEM2", "CD8 TEM GZMK-",  "CD8 TEM IFNG+", "Treg", "TRM MKI67+"))
+
+p1 <- DimPlot(tcell, group.by = "label.subset", cols = cols)
+p1
+p1 <- ggpubr::get_legend(p1)
+p1 <- ggpubr::as_ggplot(p1)
+ggsave("Manuscript_bioxiv/Figures/dump/combined_tcell_subsets_legend2.pdf", width = 2, height = 3, units = "in")
+
+DimPlot(tcell, group.by = "label.subset", cols = cols) + theme(legend.position = "none")
+ggsave("Manuscript_bioxiv/Figures/dump/combined_tcell_subsets.pdf", width = 5, height = 5, units = "in")
+
+plotdat <- SplitObject(tcell, split.by = "hiv_timepoint")
+lapply(names(plotdat), function(i){
+  x <- plotdat[[i]]
+  DimPlot(x, group.by = "label.subset", cols = cols) + theme(legend.position = "none")
+  ggsave(paste("Manuscript_bioxiv/Figures/dump/combined_tcell_subsets_", i, ".pdf", sep = ""), width = 5, height = 5, units = "in")
+})
+
+markers <- c("CD3D", "CD4", "CD8A", "CD8B", "TCF7", "CCR7", "SELL", "FOXP3", "CTLA4", "TIGIT", "PMCH", "TNFRSF4", "KLRB1", "CXCR3", "PRF1", "ITGA1", "GZMB", "IFNG", "CCL4", "CCL3", "CCL5", "CD69", "NKG7", "GZMK", "GNLY", "IL21", "RORC", "IL23R", "ITGAE", "MKI67", "HLA-DRA")
+
+DotPlot(tcell, features = markers, group.by = "label.subset", scale = F) +
+  xlab("") + ylab("") +
+  scale_color_gradient(high = "red", low = "blue") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+ggsave("Manuscript_bioxiv/Figures/dump/tcell_singlecellsubset.pdf", width = 10, height = 4, units = "in")
+
+clustree(tcell, prefix = "RNA_snn_res.")
+
+ggsave("Manuscript_bioxiv/Figures/dump/tcell_clustree.pdf", width = 8, height = 12, units = "in")
+
+clusters <- levels(tcell$label.subset)
+Idents(tcell) <- "label.subset"
+clusters <- c("CD8 TEM1", "CD8 TEM2", "CD4 TEM1", "CD4 TEM2", "Treg")
+topmarkersPercluster <- sapply(clusters, function(x){
+  message(paste("running cluster:", x, sep = ""))
+  cluster_marker <- FindMarkers(tcell, ident.1 = x, min.pct = 0.1, only.pos = F)
+  cluster_marker <- cluster_marker %>% rownames_to_column("GeneID")
+}, USE.NAMES = T, simplify = F)
+#names(topmarkersPercluster) <- unique(as.character(tcell$RNA_snn_res.0.5))
+topmarkersPercluster <- lapply(topmarkersPercluster, function(x){
+  out <- x[x$avg_log2FC >= .0378 & x$p_val_adj <= 0.05,]
+  out <- out[order(out$avg_log2FC, decreasing = T),]
+})
+write_xlsx(topmarkersPercluster, "Manuscript_bioxiv/suppliment/tcell_subset_marker_genes.xlsx")
+
+p1 <- DimPlot(tcell, group.by = "RNA_snn_res.0.5", label = T)
+p2 <- DimPlot(tcell, group.by = "label.main2", label = T)
+p <- p1 + p2
+ggsave("Manuscript_bioxiv/Figures/dump/tcell_seuratcluster.pdf", p, width = 10, height = 6, units = "in")
+
+#annotation
+#tfs
+
+FeaturePlot(tcell, features = c("TBX21", "GATA3", "RORC", "FOXP3", "BCL6", "CD3D", "CD4", "CD8A", "CD8B", "CCR7", "TNFRSF4", "RORA", "GZMA", "GZMB", "CD69", "CTLA4", "CD40LG", "TNF", "IFNG", "HLA-DRA", "TRDC")) & theme(legend.position = "none")
+ggsave("Manuscript_bioxiv/Figures/dump/tcell_featuremarkers.pdf", width = 8, height = 10, units = "in")
+
+markers <- c("TBX21", "GATA3", "RORC", "FOXP3", "BCL6", "CD3D", "CD4", "CD8A", "CD8B", "CCR7", "TNFRSF4", "RORA", "GZMA", "GZMB", "CD69", "CTLA4", "CD40LG", "TNF", "IFNG", "HLA-DRA", "TRDC")
+DotPlot(tcell, features = markers, group.by = "RNA_snn_res.0.5", scale = F) +
+  xlab("") + ylab("") +
+  scale_color_gradient(high = "red", low = "blue") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+top10 <- sapply(topmarkersPercluster, function(x){
+  x <- x[order(x$avg_log2FC, decreasing = T),]
+  x <- x$GeneID[1:10]
+})
+top10 <- as.character(top10)
+top10 <- unique(top10)
+
+#cluster 1
+DotPlot(tcell, features = top10, group.by = "RNA_snn_res.0.5", scale = F) +
+  xlab("") + ylab("") +
+  scale_color_gradient(high = "red", low = "blue") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+
+ggsave("Manuscript_bioxiv/Figures/dump/tcelltop10markers.pdf", width = 30, height = 7, units = "in")
+#cluster 7,10: FOXP3+ Treg
+#cluster 12: TOP2A+, MKI67+ proliferating Tcells
+#Clusters 0,4: similar but no distinct marker
+#cluster 5: TCF7+, SELL+, CCR7+; Th2 (CD4)
+#cluster1: no distinct marker
+#cluster9: no distinct marker
+#cluster2: NKG7+, CD8+, KLRK1+, GZMK+, GZMB+; cytotoxic CD8
+#cluster3: NKG7+, CD8+, KLRK1+, GZMK+, GZMB+; cytotoxic CD8
+#cluster8: BCL2+
+#cluster11: CD40LG+, IFNG+,  T cell
+#cluster6: no distinct marker
+
+
+#to be continued........
+DimPlot(tcell, group.by = "RNA_snn_res.0.5", split.by = "hiv_timepoint", ncol = 2, label = T)
+ggsave("Manuscript_bioxiv/Figures/dump/tcell_cluster_by_group.pdf", width = 7, height = 6, units = "in")
+
+#Trajectory
+library(monocle3)
+library(SeuratWrappers)
+tcell_cds <- as.cell_data_set(tcell)
+tcell_cds <- cluster_cells(cds = tcell_cds, reduction_method = "UMAP", 
+                       cluster_method = "louvain", k = 20)
+num_clust <- clusters(tcell_cds)
+table(num_clust)
+tcell_cds <- learn_graph(tcell_cds, close_loop = F, learn_graph_control = list(minimal_branch_len = 30, geodesic_distance_ratio = 0.6, prune_graph = T))
+
+plot_cells(tcell_cds, color_cells_by = "cluster", label_groups_by_cluster = FALSE,  label_branch_points = F, label_roots = F, label_leaves = F, group_label_size = 5)
+
+#set cluster 1 which contains present at 0hrs as the root
+tcell_cds <- order_cells(tcell_cds, reduction_method = "UMAP", root_cells = colnames(tcell_cds[, clusters(tcell_cds) == 1]))
+
+plotdat = tcell_cds
+
+plot_cells(cds = plotdat, color_cells_by = "pseudotime", show_trajectory_graph = TRUE, cell_size = 1, trajectory_graph_color = "black", trajectory_graph_segment_size = 1, label_roots = F, label_leaves = F, label_branch_points = F) 
+
+ggsave("Manuscript_bioxiv/Figures/dump/pseudotime_tcell.pdf", width = 7, height = 4.5, units = "in")
+rm(plotdat)
+```
+
+
+```{r}
+test <- data.frame(val = 1:9, labels = c("CD4 TCM", "CD4 TEM1", "CD4 TEM2", "CD8 TEM1", "CD8 TEM2", "CD8 TEM GZMK-",  "CD8 TEM IFNG+", "Treg", "TRM MKI67+"))
+test$labels <- factor(test$labels, levels = c("CD4 TCM", "CD4 TEM1", "CD4 TEM2", "CD8 TEM1", "CD8 TEM2", "CD8 TEM GZMK-",  "CD8 TEM IFNG+", "Treg", "TRM MKI67+"))
+
+leg_lab = c(expression("CD4 T"['C'*'M'*phantom("+")]~"            "),
+            expression("CD4 T"['E'*'M1'*phantom("+")~"               "]),
+            expression("CD4 T"['E'*'M2'*phantom("+")~"               "]),
+            expression("CD8 T"['E'*'M1'*phantom("+")~"               "]),
+            expression("CD8 T"['E'*'M2'*phantom("+")~"               "]),
+            expression("CD8 T"['E'*'M'*phantom("+")]~"GZMK-"),
+            expression("CD8 T"['E'*'M'*phantom("+")]~"IFNG+"),
+            expression(CD4T['C'*'M'*phantom("+")]),
+            expression(CD4T['C'*'M'*phantom("+")]))
+ggplot(test, aes(x = labels, y = val, col = labels)) + geom_point() + scale_color_discrete(labels = leg_lab)
+```
+
+
+```{r}
+cols <- c("#386cb0","#fdb462","#7fc97f","#ef3b2c","#662506","#a6cee3",
+         "#fb9a99","#6A3D9A","#F6DF07", "#F0027F","#BF5B17", "#666666",
+         "#33A02C", "#FF7F00", "#E78AC3")
+
+DimPlot(tcell, group.by = "label.subset", cols = cols) + theme(plot.title = element_blank(), legend.position = "bottom", legend.direction = "horizontal")
+
+ggsave("Manuscript_bioxiv/Figures/dump/combined_tcell_subsets.pdf", width = 7, height = 6, units = "in")
+
+plotdat <- SplitObject(tcell, split.by = "hiv_timepoint")
+
+p1 <- plotdat$`HC+Mtb`
+DimPlot(p1, group.by = "label.subset", cols = cols) + theme(plot.title = element_blank(), legend.position = "none")
+ggsave("Manuscript_bioxiv/Figures/dump/combined_tcell_subsets_HCmtb.pdf", width = 7, height = 5.5, units = "in")
+
+p2 <- plotdat$`PLWH+Mtb`
+DimPlot(p2, group.by = "label.subset", cols = cols) + theme(plot.title = element_blank(), legend.position = "none")
+ggsave("Manuscript_bioxiv/Figures/dump/combined_tcell_subsets_PLWHmtb.pdf", width = 7, height = 5.5, units = "in")
+
+DimPlot(tcell, group.by = "label.subset", split.by = "hiv_timepoint", cols = cols)
+```
+
+```{r}
+#label tcell subsets
+label.subset <- tcell@meta.data %>%
+  select(seurat_clusters) %>%
+  mutate(label.subset = ifelse(seurat_clusters %in% c(0,4,8), "CD4+ T Act 1", ifelse(seurat_clusters == 1, "CD4+ T Act 2", ifelse(seurat_clusters %in% c(6, 12), "CD4+ T Act 3", ifelse(seurat_clusters == 2, "CD8+ T Act 1", ifelse(seurat_clusters == 3, "CD8+ T Act 2", ifelse(seurat_clusters == 5, "CD4+ EM", ifelse(seurat_clusters %in% c(7,10), "Treg", ifelse(seurat_clusters == 9, "Act T cell", "TC1"))))))))) %>%
+  select(label.subset)
+label.subset$label.subset <- factor(label.subset$label.subset, 
+                                    levels = unique(label.subset$label.subset)[c(2, 5, 6, 1, 3, 7, 9, 4, 8)])
+tcell <- AddMetaData(tcell, metadata = label.subset)
+
+markers <- c("CD3D", "CD4","CD8A","CD8B","CCR7", "SELL", "CD44","TNFRSF4", "RORA", "GZMB", "GZMA", "CD69", "ITGAE", "CTLA4", "FOXP3", "IKZF2", "CD40LG", "STAT1", "TNF", "IFNG", "IL2", "GATA3", "HLA-DRA", "HLA-DRB1")
+
+DotPlot(tcell, features = markers, group.by = "label.subset", scale = F) +
+  xlab("") + ylab("") +
+  scale_color_gradient(high = "red", low = "blue") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+#DEG analysis
+```{r}
+Idents(tcell) <- "label.subset"
+celltypes <- as.character(unique(tcell$label.subset))
+celltypes <- celltypes[!celltypes %in% c("TRM MKI67+", "CD8 TEM IFNG+")]
+celltypes <- c("CD8 TEM1", "CD8 TEM2", "CD4 TEM2", "Treg")
+topTables_DE_tcell_pos_neg_4hrs = sapply(celltypes, 
+                         simplify = F, 
+                         USE.NAMES = T, function(x){
+                           print(x)
+                           subs <- subset(tcell,  
+                                          subset = label.subset ==  x) 
+                           Idents(subs) <- subs@meta.data$hiv_timepoint
+                           subs <- subset(subs, subset = hiv_timepoint %in% c("PLWH+Mtb", "HC+Mtb"))
+                           print(unique(subs@meta.data$hiv_timepoint))
+                           
+                           df <- FindMarkers(subs, ident.1 = "PLWH+Mtb", ident.2 = "HC+Mtb",
+                                             only.pos = F,
+                                             min.pct = 0,
+                                             logfc.threshold = 0)
+                           
+                           df <- rownames_to_column(df, var = 'GeneID')
+                           return(df)
+                         })
+
+saveRDS(topTables_DE_tcell_pos_neg_4hrs, "rds_data/topTables_DE_tcell_pos_neg_4hrs.rds")
+```
+# MA plots
+```{r}
+library(ggpubr)
+plotdat <- topTables_DE_tcell_pos_neg_4hrs$`CD8 TEM`
+
+test <- AverageExpression(tcell, group.by = "label.subset")[[1]]
+test <- as.data.frame(test)
+test$log2exp <- log2(test$`CD8 TEM` + 1)
+test <- test %>% rownames_to_column("GeneID")
+
+plotdat <- merge(plotdat, test, by = "GeneID")
+plotdat <- plotdat[c("GeneID", "avg_log2FC", "p_val_adj", "log2exp")]
+#topTables_global <- topTables_global %>% column_to_rownames("GeneID")
+colnames(plotdat) <- c("GeneID","log2FoldChange", "padj", "baseMeanLog2")
+
+#label.select = c("APOC1", "C1QA", "CD68", "CD74", "HLA-DRB1", "IL1RN", "IRF7", "LYZ", "MARCO", "MT-ATP8", "TNFSF13")
+set.seed(101010)
+ggmaplot(plotdat, fdr = 0.05, fc = 1.3, size = 1.5, palette = c("#B31B21", "#1465AC", "darkgray"), genenames = as.vector(plotdat$GeneID), legend = "top", top = 50, font.label = c("bold", 14), label.rectangle = TRUE, font.legend = "bold", font.main = "bold", ggtheme = ggplot2::theme_minimal()) + scale_y_continuous(limits = c(-2, 2.6)) + scale_x_continuous(limits = c(0,6)) + theme(axis.text.x = element_text(color = "black", size = 12), axis.text.y = element_text(color = "black", size = 12), axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12), legend.text = element_text(size = 16)) +  guides(colour = guide_legend(override.aes = list(size=10)))
+
+ggsave("Manuscript_bioxiv/Figures/dump/Figure_MAplot_CD8TEM.png", width = 9, height = 6, units = "in")
+
+plotdat <- topTables_DE_tcell_pos_neg_4hrs$Treg
+
+test <- AverageExpression(tcell, group.by = "label.subset")[[1]]
+test <- as.data.frame(test)
+test$log2exp <- log2(test$Treg + 1)
+test <- test %>% rownames_to_column("GeneID")
+
+plotdat <- merge(plotdat, test, by = "GeneID")
+plotdat <- plotdat[c("GeneID", "avg_log2FC", "p_val_adj", "log2exp")]
+#topTables_global <- topTables_global %>% column_to_rownames("GeneID")
+colnames(plotdat) <- c("GeneID","log2FoldChange", "padj", "baseMeanLog2")
+
+#label.select = c("CD96", "CXCR4", "GIMAP4", "HLA-B", "IFI6", "IRF7", "IRF9", "ITGB1", "MT-ATP8", "STAT1", "TRBV6-8")
+set.seed(101010)
+ggmaplot(plotdat, fdr = 0.05, fc = 1.3, size = 1.5, palette = c("#B31B21", "#1465AC", "darkgray"), genenames = as.vector(plotdat$GeneID), legend = "top", top = 50, font.label = c("bold", 14), label.rectangle = TRUE, font.legend = "bold", font.main = "bold", ggtheme = ggplot2::theme_minimal()) + scale_y_continuous(limits = c(-2.6, 2.6)) + scale_x_continuous(limits = c(0,6)) + theme(axis.text.x = element_text(color = "black", size = 12), axis.text.y = element_text(color = "black", size = 12), axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12), legend.text = element_text(size = 16)) +  guides(colour = guide_legend(override.aes = list(size=10)))
+
+ggsave("Manuscript_bioxiv/Figures/dump/Figure_MAplot_Treg.png", width = 9, height = 6, units = "in")
+
+plotdat <- topTables_DE_tcell_pos_neg_4hrs$`CD4 TRM`
+
+test <- AverageExpression(tcell, group.by = "label.subset")[[1]]
+test <- as.data.frame(test)
+test$log2exp <- log2(test$`CD4 TRM` + 1)
+test <- test %>% rownames_to_column("GeneID")
+
+plotdat <- merge(plotdat, test, by = "GeneID")
+plotdat <- plotdat[c("GeneID", "avg_log2FC", "p_val_adj", "log2exp")]
+#topTables_global <- topTables_global %>% column_to_rownames("GeneID")
+colnames(plotdat) <- c("GeneID","log2FoldChange", "padj", "baseMeanLog2")
+
+#label.select = c("APOC1", "CD47", "HIF1A", "HSBP1", "MAP2K2", "MT-ATP8", "PRDM1", "RAB1A", "STAT3", "STAT5B", "TFRC", "TNFRSF1A", "TNFRSF1B", "TOP2B")
+set.seed(101010)
+ggmaplot(plotdat, fdr = 0.05, fc = 1.3, size = 1.5, palette = c("#B31B21", "#1465AC", "darkgray"), genenames = as.vector(plotdat$GeneID), legend = "top", top = 50, font.label = c("bold", 14), label.rectangle = TRUE, font.legend = "bold", font.main = "bold", ggtheme = ggplot2::theme_minimal(), alpha = 0.8) + scale_y_continuous(limits = c(-2.3, 2.3)) + scale_x_continuous(limits = c(0,7.3)) + theme(axis.text.x = element_text(color = "black", size = 12), axis.text.y = element_text(color = "black", size = 12), axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12), legend.text = element_text(size = 16)) +  guides(colour = guide_legend(override.aes = list(size=10)))
+
+ggsave("Manuscript_bioxiv/Figures/dump/Figure_MAplot_CD4TRM.png", width = 9, height = 6, units = "in")
+
+plotdat <- topTables_DE_tcell_pos_neg_4hrs$`CD8 TCM`
+
+test <- AverageExpression(tcell, group.by = "label.subset")[[1]]
+test <- as.data.frame(test)
+test$log2exp <- log2(test$`CD8 TCM` + 1)
+test <- test %>% rownames_to_column("GeneID")
+
+plotdat <- merge(plotdat, test, by = "GeneID")
+plotdat <- plotdat[c("GeneID", "avg_log2FC", "p_val_adj", "log2exp")]
+#topTables_global <- topTables_global %>% column_to_rownames("GeneID")
+colnames(plotdat) <- c("GeneID","log2FoldChange", "padj", "baseMeanLog2")
+
+#label.select = c("APOC1", "CD164", "CD74", "CXCL3", "CXCL8", "CXCR4", "DUSP4", "HLA-B", "IFI6", "IL10RA", "IL1B", "IL7R", "IRF7", "IRF9", "MT-ND1", "STAT1", "TRBV3-1")
+set.seed(101010)
+ggmaplot(plotdat, fdr = 0.05, fc = 1.3, size = 1.5, palette = c("#B31B21", "#1465AC", "darkgray"), genenames = as.vector(plotdat$GeneID), legend = "top", top = 50, font.label = c("bold", 14), label.rectangle = TRUE, font.legend = "bold", font.main = "bold", ggtheme = ggplot2::theme_minimal()) + scale_y_continuous(limits = c(-3, 3)) + scale_x_continuous(limits = c(0,7.3)) + theme(axis.text.x = element_text(color = "black", size = 12), axis.text.y = element_text(color = "black", size = 12), axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12), legend.text = element_text(size = 16)) +  guides(colour = guide_legend(override.aes = list(size=10)))
+
+ggsave("Manuscript_bioxiv/Figures/dump/Figure_MAplot_CD8TCM.png", width = 9, height = 6, units = "in")
+
+plotdat <- topTables_DE_tcell_pos_neg_4hrs$`Act T cell`
+
+test <- AverageExpression(tcell, group.by = "label.subset")[[1]]
+test <- as.data.frame(test)
+test$log2exp <- log2(test$`Act T cell` + 1)
+test <- test %>% rownames_to_column("GeneID")
+
+plotdat <- merge(plotdat, test, by = "GeneID")
+plotdat <- plotdat[c("GeneID", "avg_log2FC", "p_val_adj", "log2exp")]
+#topTables_global <- topTables_global %>% column_to_rownames("GeneID")
+colnames(plotdat) <- c("GeneID","log2FoldChange", "padj", "baseMeanLog2")
+
+label.select = c("APOC1", "CD164", "CD74", "CXCL3", "CXCL8", "CXCR4", "DUSP4", "HLA-B", "IFI6", "IL10RA", "IL1B", "IL7R", "IRF7", "IRF9", "MT-ND1", "STAT1", "TRBV3-1")
+set.seed(101010)
+ggmaplot(plotdat, fdr = 0.05, fc = 1.3, size = 1.5, palette = c("#B31B21", "#1465AC", "darkgray"), genenames = as.vector(plotdat$GeneID), legend = "top", top = 10, font.label = c("bold", 14), label.rectangle = TRUE, font.legend = "bold", font.main = "bold", ggtheme = ggplot2::theme_minimal()) + scale_y_continuous(limits = c(-2, 2.1)) + scale_x_continuous(limits = c(0,7.3)) + theme(axis.text.x = element_text(color = "black", size = 12), axis.text.y = element_text(color = "black", size = 12), axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12), legend.text = element_text(size = 16)) +  guides(colour = guide_legend(override.aes = list(size=10)))
+
+ggsave("Manuscript_bioxiv/Figures/dump/Figure_MAplot_ActTcell.png", width = 9, height = 6, units = "in")
+```
+
+# Global MA plot
+```{r}
+library(ggpubr)
+plotdat <- topTables_DE_pos_neg_4hrs$AM
+
+test <- AverageExpression(am, group.by = "orig.ident")[[1]]
+test <- as.data.frame(test)
+test$log2exp <- log2(test$all + 1)
+test <- test %>% rownames_to_column("GeneID")
+
+plotdat <- merge(plotdat, test, by = "GeneID")
+plotdat <- plotdat[c("GeneID", "avg_log2FC", "p_val_adj", "log2exp")]
+#topTables_global <- topTables_global %>% column_to_rownames("GeneID")
+colnames(plotdat) <- c("GeneID","log2FoldChange", "padj", "baseMeanLog2")
+
+#label.select = c("APOC1", "C1QA", "CD68", "CD74", "HLA-DRB1", "IL1RN", "IRF7", "LYZ", "MARCO", "MT-ATP8", "TNFSF13")
+set.seed(101010)
+ggmaplot(plotdat, fdr = 0.05, fc = 1.3, size = 1.5, palette = c("#B31B21", "#1465AC", "darkgray"), genenames = as.vector(plotdat$GeneID), legend = "top", top = 0, font.label = c("bold", 14), label.select = c("TNF"), label.rectangle = TRUE, font.legend = "bold", font.main = "bold", ggtheme = ggplot2::theme_minimal()) + scale_y_continuous(limits = c(-2, 2.6)) + scale_x_continuous(limits = c(0,6)) + theme(axis.text.x = element_text(color = "black", size = 12), axis.text.y = element_text(color = "black", size = 12), axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12), legend.text = element_text(size = 16)) +  guides(colour = guide_legend(override.aes = list(size=10)))
+
+ggsave("Manuscript_bioxiv/Figures/dump/maplot_global_not.pdf", width = 7.5, height = 4, units = "in")
+```
+
+
+```{r}
+all_gene_sets = msigdbr(species = "Homo sapiens")
+gene_subcats = sapply(all_gene_sets$gs_name, function(x){
+  out = gsub('_.*', '', x)
+  out = gsub('(GSE).*', '\\1', out)
+}, USE.NAMES = F)
+
+filtered_gene_sets <- all_gene_sets[which(gene_subcats %in% c("GOBP", "GOMF", "REACTOME", "KEGG", "HALLMARK")),]
+filtered_gene_sets <- all_gene_sets[which(gene_subcats %in% c("REACTOME", "HALLMARK")),]
+filtered_gene_sets <- all_gene_sets[all_gene_sets$gs_name %in% c("KEGG_OXIDATIVE_PHOSPHORYLATION", "REACTOME_RESPIRATORY_ELECTRON_TRANSPORT", "GOBP_RESPONSE_TO_OXIDATIVE_STRESS", "REACTOME_REGULATION_OF_TNFR1_SIGNALING", "HALLMARK_TNFA_SIGNALING_VIA_NFKB", "REACTOME_INTERLEUKIN_2_SIGNALING", "GOBP_RESPONSE_TO_INTERLEUKIN_17", "REACTOME_INTERLEUKIN_15_SIGNALING", "REACTOME_INTERLEUKIN_21_SIGNALING", "REACTOME_INTERLEUKIN_2_FAMILY_SIGNALING", "GOBP_POSITIVE_REGULATION_OF_INTERLEUKIN_4_PRODUCTION", "REACTOME_INTERLEUKIN_17_SIGNALING", "GOBP_INTERLEUKIN_10_PRODUCTION", "REACTOME_INTERLEUKIN_6_SIGNALING", "REACTOME_INTERLEUKIN_4_AND_INTERLEUKIN_13_SIGNALING", "REACTOME_INTERLEUKIN_10_SIGNALING"),]
+filtered_gene_sets <- all_gene_sets[all_gene_sets$gs_name %in% unique(plotdat$pathway),]
+
+msigdbr_list = split(x = filtered_gene_sets$gene_symbol, f = filtered_gene_sets$gs_name)
+
+fgsea_genelist = lapply(seq_along(topTables_DE_tcell_pos_neg_4hrs), function(i){
+  x = topTables_DE_tcell_pos_neg_4hrs[[i]]
+  print(names(topTables_DE_tcell_pos_neg_4hrs)[i])
+  minx <- x[x$p_val != 0,]
+  x$p_val[x$p_val == 0] <- min(minx$p_val)
+  preranked = x %>%
+    #mutate_at(2:6,~replace(., . == 0, min(.[.>0], na.rm = TRUE))) %>%
+    mutate(logp = -log10(p_val) * sign(avg_log2FC)) %>%
+    #filter(!grepl('Mt-', GeneID)) %>%
+    arrange(logp)
+  rankset = setNames(preranked$logp, preranked$GeneID)
+  fgsea_out = fgsea(pathways = msigdbr_list, stats = rankset)
+  fgsea_out$leadingEdge = sapply(fgsea_out$leadingEdge, function(x){
+    x = paste(x, collapse = ',')
+  })
+  fgsea_out = fgsea_out[order(fgsea_out$padj),]
+  return(fgsea_out)
+})
+names(fgsea_genelist) = names(topTables_DE_tcell_pos_neg_4hrs)
+
+gsea_signif = lapply(fgsea_genelist, function(x){
+  #x = x[x$pval <= 0.05,]
+  #x <- x[x$size >= 10,]
+  new_pathway = sapply(strsplit(x$pathway, split = '_'), function(y){
+    y = y[-1]
+    out = paste(y, collapse = ' ')
+  })
+  x$pathway2 = new_pathway
+  x = x[order(x$NES, decreasing = T),]
+})
+
+#combine cell types
+combined_fgsea = lapply(gsea_signif, function(x){
+  xlist = x[order(x$NES, decreasing = T),]
+  xlist$pathway3 = gsub('_', ' ', xlist$pathway)
+  xlist$pathway3 = str_wrap(xlist$pathway3, 45)
+  xlist$pathway3 = factor(xlist$pathway3, levels = rev(unique(xlist$pathway3)))
+  xlist$status = cut(xlist$NES, breaks = c(-Inf, 0, Inf), 
+                     labels  = c('Down-reg', 'Up-reg'))
+  return(xlist)
+})
+
+combined_fgsea = bind_rows(combined_fgsea, .id = 'Cluster_ID')
+
+plotdat <- combined_fgsea
+plotdat <- combined_fgsea[grep("mitochond|ATP|oxidative|NADH|TCA|electron|cytokine|interleukin|TNF|interferon|IL2|IL6", combined_fgsea$pathway3, ignore.case = T),]
+plotdat$pathway3 <- as.character(plotdat$pathway3)
+pathorder <- c(grep("interleukin|cytokine",unique(plotdat$pathway3), invert = T, value = T, ignore.case = T), grep("interleukin|cytokine",unique(plotdat$pathway3), invert = F, value = T, ignore.case = T))
+plotdat$pathway3 <- factor(plotdat$pathway3, levels = rev(pathorder))
+plotdat$neglog10pval <- -log10(plotdat$pval)
+
+#plotdat$pathway3 <- factor(plotdat$pathway3, levels = rev(c("GOBP LIPID LOCALIZATION", "GOBP RESPONSE TO LIPID", "GOBP RESPONSE TO OXIDATIVE STRESS", "REACTOME FATTY ACID METABOLISM", "REACTOME MITOCHONDRIAL FATTY ACID BETA OXIDATION", "GOBP OXIDATIVE PHOSPHORYLATION", "GOBP ATP METABOLIC PROCESS", "GOMF ELECTRON TRANSFER ACTIVITY", "GOBP MITOCHONDRIAL RESPIRATORY CHAIN COMPLEX\nASSEMBLY", "GOBP RESPONSE TO CYTOKINE")))
+plotdat$Cluster_ID <- gsub("Cluster ", "", plotdat$Cluster_ID)
+plotdat$Cluster_ID <- factor(plotdat$Cluster_ID, levels = c("CD4 TCM", "CD4 TEM1", "CD4 TEM2", "CD8 TEM1", "CD8 TEM2", "CD8 TEM GZMK-", "Treg"))
+ggplot(plotdat, aes(x = Cluster_ID, y = pathway3, color = NES)) +
+    geom_point(aes(size = neglog10pval)) +
+    xlab("") +
+    theme_Publication() + 
+    #labs(title = "GSEA of each cluster compared to other clusters") +
+    scale_color_gradient2(low = '#2166ac', high = '#b2182b') +
+    scale_size(range = c(2, 6)) + scale_y_discrete(position = "right") +
+    theme(axis.text.x = element_text(size = 10, angle = 90, vjust = 0.5, hjust = 1),
+          axis.text.y = element_text(size = 10),
+          axis.title.y = element_blank(),
+          plot.title = element_text(size = 12, face = 'bold', hjust = 0,
+                                    vjust = 1),
+          legend.position = 'bottom',
+          legend.direction = 'horizontal', legend.title = element_blank()) 
+
+ggsave("Manuscript_bioxiv/Figures/dump/gsea_tcellclusters_reactomehall.png", width = 9, height = 12, limitsize = F, units = "in")
+ggsave("Manuscript_bioxiv/Figures/dump/gsea_tcellhivposneg4hrs.pdf", width = 6.5, height = 6, limitsize = F, units = "in")
+ggsave("Manuscript_bioxiv/Figures/dump/legend1.pdf", width = 8, height = 6, limitsize = F, units = "in")
+```
+
+#Cellchat AM and T cell subsets
+```{r}
+amtcell_merged <- merge(am, tcell)
+```
+
+# HC+Mtb
+```{r}
+data.input = GetAssayData(amtcell_merged, assay = "RNA", layer = "data") 
+meta = amtcell_merged@meta.data
+
+##filter cells
+cell.use = rownames(meta)[meta$hiv_timepoint == 'HC+Mtb']
+data.input.fil = data.input[,cell.use]
+meta.fil = meta[cell.use,]
+
+cellchat_hivneg4hrs = createCellChat(object = data.input.fil, meta = meta.fil, group.by = "label.subset")
+
+#Set the ligand-receptor interaction database
+CellChatDB = CellChatDB.human
+cellchat_hivneg4hrs@DB = CellChatDB
+cellchat_hivneg4hrs = subsetData(cellchat_hivneg4hrs, features = NULL)
+#future::plan("multisession", workers = 8)
+cellchat_hivneg4hrs = identifyOverExpressedGenes(cellchat_hivneg4hrs)
+cellchat_hivneg4hrs = identifyOverExpressedInteractions(cellchat_hivneg4hrs)
+cellchat_hivneg4hrs = projectData(cellchat_hivneg4hrs, PPI.human)
+
+#Compute the communication probability and infer cellular communication network
+cellchat_hivneg4hrs = computeCommunProb(cellchat_hivneg4hrs, type = 'triMean', population.size = T)
+cellchat_hivneg4hrs <- filterCommunication(cellchat_hivneg4hrs, min.cells = 10)
+cellchat_hivneg4hrs <- computeCommunProbPathway(cellchat_hivneg4hrs)
+cellchat_hivneg4hrs <- aggregateNet(cellchat_hivneg4hrs)
+
+#visualization
+rm(cell.use, data.input.fil, meta.fil)
+
+pdf("Manuscript_bioxiv/Figures/dump/Cellchat_amtcell_hivneg4hr_TNF.pdf", width = 5.2, height = 5.2)
+netVisual_aggregate(cellchat_hivneg4hrs, signaling = "TNF", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.6, vertex.label.cex = 1, margin = 0)
+dev.off()
+
+pdf("Manuscript_bioxiv/Figures/dump/Cellchat_amtcell_hivneg4hr_CXCL.pdf", width = 5.2, height = 5.2)
+netVisual_aggregate(cellchat_hivneg4hrs, signaling = "CXCL", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.6, vertex.label.cex = 1, margin = 0)
+dev.off()
+
+pdf("Manuscript_bioxiv/Figures/dump/Cellchat_amtcell_hivneg4hr_CD96.pdf", width = 5.2, height = 5.2)
+netVisual_aggregate(cellchat_hivneg4hrs, signaling = "CD96", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.6, vertex.label.cex = 1, margin = 0)
+dev.off()
+
+pdf("Manuscript_bioxiv/Figures/dump/Cellchat_amtcell_hivneg4hr_CD86.pdf", width = 5.2, height = 5.2)
+netVisual_aggregate(cellchat_hivneg4hrs, signaling = "CD86", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.6, vertex.label.cex = 1, margin = 0)
+dev.off()
+
+pdf("Manuscript_bioxiv/Figures/dump/Cellchat_amtcell_hivneg4hr_LCK.pdf", width = 5.2, height = 5.2)
+netVisual_aggregate(cellchat_hivneg4hrs, signaling = "LCK", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.6, vertex.label.cex = 1, margin = 0)
+dev.off()
+
+pdf("Manuscript_bioxiv/Figures/dump/Cellchat_amtcell_hivneg4hr_Prostaglandin.pdf", width = 5.2, height = 5.2)
+netVisual_aggregate(cellchat_hivneg4hrs, signaling = "Prostaglandin", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.6, vertex.label.cex = 1, margin = 0)
+dev.off()
+```
+
+# PLWH+Mtb
+```{r}
+data.input = GetAssayData(amtcell_merged, assay = "RNA", layer = "data") 
+meta = amtcell_merged@meta.data
+
+##filter cells
+cell.use = rownames(meta)[meta$hiv_timepoint == 'PLWH+Mtb']
+data.input.fil = data.input[,cell.use]
+meta.fil = meta[cell.use,]
+
+cellchat_hiv4hrs = createCellChat(object = data.input.fil, meta = meta.fil, 
+                          group.by = "label.subset")
+
+#Set the ligand-receptor interaction database
+CellChatDB = CellChatDB.human
+cellchat_hiv4hrs@DB = CellChatDB
+cellchat_hiv4hrs = subsetData(cellchat_hiv4hrs, features = NULL)
+#future::plan("multisession", workers = 8)
+cellchat_hiv4hrs = identifyOverExpressedGenes(cellchat_hiv4hrs)
+cellchat_hiv4hrs = identifyOverExpressedInteractions(cellchat_hiv4hrs)
+cellchat_hiv4hrs = projectData(cellchat_hiv4hrs, PPI.human)
+
+#Compute the communication probability and infer cellular communication network
+cellchat_hiv4hrs = computeCommunProb(cellchat_hiv4hrs, type = 'triMean', population.size = T)
+cellchat_hiv4hrs <- filterCommunication(cellchat_hiv4hrs, min.cells = 10)
+cellchat_hiv4hrs <- computeCommunProbPathway(cellchat_hiv4hrs)
+cellchat_hiv4hrs <- aggregateNet(cellchat_hiv4hrs)
+
+rm(cell.use, data.input.fil, meta.fil)
+
+
+pdf("Manuscript_bioxiv/Figures/dump/Cellchat_amtcell_hivpos4hr_TNF.pdf", width = 5.2, height = 5.2)
+netVisual_aggregate(cellchat_hiv4hrs, signaling = "TNF", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.6, vertex.label.cex = 1, margin = 0)
+dev.off()
+
+pdf("Manuscript_bioxiv/Figures/dump/Cellchat_amtcell_hivpos4hr_CXCL.pdf", width = 5.2, height = 5.2)
+netVisual_aggregate(cellchat_hiv4hrs, signaling = "CXCL", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.6, vertex.label.cex = 1, margin = 0)
+dev.off()
+
+pdf("Manuscript_bioxiv/Figures/dump/Cellchat_amtcell_hivpos4hr_CD96.pdf", width = 5.2, height = 5.2)
+netVisual_aggregate(cellchat_hiv4hrs, signaling = "CD96", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.6, vertex.label.cex = 1, margin = 0)
+dev.off()
+
+pdf("Manuscript_bioxiv/Figures/dump/Cellchat_amtcell_hivpos4hr_CD86.pdf", width = 5.2, height = 5.2)
+netVisual_aggregate(cellchat_hiv4hrs, signaling = "CD86", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.6, vertex.label.cex = 1, margin = 0)
+dev.off()
+
+pdf("Manuscript_bioxiv/Figures/dump/Cellchat_amtcell_hivpos4hr_LCK.pdf", width = 5.2, height = 5.2)
+netVisual_aggregate(cellchat_hiv4hrs, signaling = "LCK", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.6, vertex.label.cex = 1, margin = 0)
+dev.off()
+
+pdf("Manuscript_bioxiv/Figures/dump/Cellchat_amtcell_hivpos4hr_Prostaglandin.pdf", width = 5.2, height = 5.2)
+netVisual_aggregate(cellchat_hiv4hrs, signaling = "Prostaglandin", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.6, vertex.label.cex = 1, margin = 0)
+dev.off()
+```
+#compare data
+```{r}
+object_list <- list(cellchat_hivneg4hrs, cellchat_hiv4hrs)
+
+saveRDS(object_list, "rds_data/cellchat_objectlist_label.main2.rds")
+# Merge cellchat objects:
+cellchat <- mergeCellChat(object_list, add.names = c("HC+Mtb", "PLWH+Mtb"))
+
+#saveRDS(cellchat, file = 'cellchat_object_merged.rds')
+
+rankNet(cellchat, mode = "comparison", comparison = c(1,2), stacked = T, do.stat = F, color.use = c("#b2df8a", "#ff7f00"), signaling = c("IL6", "CD86", "IL1", "TNF", "APRIL", "BAFF", "MHC-I", "VEGF", "CD39", "LIGHT", "CCL", "SPP1")) +  theme(legend.position = "bottom", 
+        legend.direction = "horizontal",
+        legend.margin=margin(0,0,0,0),
+        legend.box.margin=margin(-10,-10,-10,-10),
+        #axis.text.y = element_text(colour = c(rep("#e41a1c",6), rep("#4daf4a", 7))),
+        axis.text.x = element_text(size = 11))
+ggsave("Manuscript_bioxiv/Figures/dump/relative_info_flow_amtcell_hiv_pos_neg_4hrs_fil.pdf", width = 6, height = 2.2)
+
+signals <- union(cellchat@netP$`HC+Mtb`$pathways, cellchat@netP$`PLWH+Mtb`$pathways)
+signals <- signals[!signals %in% c("CD40", "CSF")]
+
+rankNet(cellchat, mode = "comparison", comparison = c(1,2), stacked = T, do.stat = F, color.use = c("#b2df8a", "#ff7f00"), signaling = signals) +  theme(legend.position = "bottom", 
+        legend.direction = "horizontal",
+        legend.margin=margin(0,0,0,0),
+        legend.box.margin=margin(-10,-10,-10,-10),
+        #axis.text.y = element_text(colour = c(rep("#e41a1c",6), rep("#4daf4a", 7))),
+        axis.text.x = element_text(size = 11))
+ggsave("Manuscript_bioxiv/Figures/dump/relative_info_flow_amtcell_hiv_pos_neg_4hrs.pdf", width = 6, height = 9)
+```
+
+```{r}
+plotGeneExpression(cellchat_hivneg4hrs, signaling = "TNF", enriched.only = TRUE, type = "violin")
+plotGeneExpression(cellchat_hiv4hrs, signaling = "TNF", enriched.only = TRUE, type = "violin")
+
+compareInteractions(cellchat, show.legend = F, group = c(1,2))
+
+netVisual_diffInteraction(cellchat, weight.scale = T, comparison = c(1,2), measure = "weight")
+```
+
+# HC
+```{r}
+data.input = GetAssayData(amtcell_merged, assay = "RNA", layer = "data") 
+meta = amtcell_merged@meta.data
+
+##filter cells
+cell.use = rownames(meta)[meta$hiv_timepoint == 'HC']
+data.input.fil = data.input[,cell.use]
+meta.fil = meta[cell.use,]
+
+cellchat_hivneg0hrs = createCellChat(object = data.input.fil, meta = meta.fil, group.by = "label.subset")
+
+#Set the ligand-receptor interaction database
+CellChatDB = CellChatDB.human
+cellchat_hivneg0hrs@DB = CellChatDB
+cellchat_hivneg0hrs = subsetData(cellchat_hivneg0hrs, features = NULL)
+#future::plan("multisession", workers = 8)
+cellchat_hivneg0hrs = identifyOverExpressedGenes(cellchat_hivneg0hrs)
+cellchat_hivneg0hrs = identifyOverExpressedInteractions(cellchat_hivneg0hrs)
+cellchat_hivneg0hrs = projectData(cellchat_hivneg0hrs, PPI.human)
+
+#Compute the communication probability and infer cellular communication network
+cellchat_hivneg0hrs = computeCommunProb(cellchat_hivneg0hrs, type = 'triMean', population.size = T)
+cellchat_hivneg0hrs <- filterCommunication(cellchat_hivneg0hrs, min.cells = 10)
+cellchat_hivneg0hrs <- computeCommunProbPathway(cellchat_hivneg0hrs)
+cellchat_hivneg0hrs <- aggregateNet(cellchat_hivneg0hrs)
+
+#visualization
+rm(cell.use, data.input.fil, meta.fil)
+```
+
+# PLWH
+```{r}
+data.input = GetAssayData(amtcell_merged, assay = "RNA", layer = "data") 
+meta = amtcell_merged@meta.data
+
+##filter cells
+cell.use = rownames(meta)[meta$hiv_timepoint == 'PLWH']
+data.input.fil = data.input[,cell.use]
+meta.fil = meta[cell.use,]
+
+cellchat_hiv0hrs = createCellChat(object = data.input.fil, meta = meta.fil, 
+                          group.by = "label.subset")
+
+#Set the ligand-receptor interaction database
+CellChatDB = CellChatDB.human
+cellchat_hiv0hrs@DB = CellChatDB
+cellchat_hiv0hrs = subsetData(cellchat_hiv0hrs, features = NULL)
+#future::plan("multisession", workers = 8)
+cellchat_hiv0hrs = identifyOverExpressedGenes(cellchat_hiv0hrs)
+cellchat_hiv0hrs = identifyOverExpressedInteractions(cellchat_hiv0hrs)
+cellchat_hiv0hrs = projectData(cellchat_hiv0hrs, PPI.human)
+
+#Compute the communication probability and infer cellular communication network
+cellchat_hiv0hrs = computeCommunProb(cellchat_hiv0hrs, type = 'triMean', population.size = T)
+cellchat_hiv0hrs <- filterCommunication(cellchat_hiv0hrs, min.cells = 10)
+cellchat_hiv0hrs <- computeCommunProbPathway(cellchat_hiv0hrs)
+cellchat_hiv0hrs <- aggregateNet(cellchat_hiv0hrs)
+
+rm(cell.use, data.input.fil, meta.fil)
+```
+
+```{r}
+object_list <- list(cellchat_hivneg0hrs, cellchat_hiv0hrs)
+
+saveRDS(object_list, "rds_data/cellchat_objectlist_label.main2.rds")
+# Merge cellchat objects:
+cellchat <- mergeCellChat(object_list, add.names = c("HC", "PLWH"))
+
+#saveRDS(cellchat, file = 'cellchat_object_merged.rds')
+
+
+signals <- union(cellchat@netP$`HC+Mtb`$pathways, cellchat@netP$`PLWH+Mtb`$pathways)
+signals <- signals[!signals %in% c("CD40", "CSF")]
+
+rankNet(cellchat, mode = "comparison", comparison = c(1,2), stacked = T, do.stat = F, color.use = c("#4daf4a", "#e41a1c")) +  theme(legend.position = "bottom", 
+        legend.direction = "horizontal",
+        legend.margin=margin(0,0,0,0),
+        legend.box.margin=margin(-10,-10,-10,-10),
+        #axis.text.y = element_text(colour = c(rep("#e41a1c",6), rep("#4daf4a", 7))),
+        axis.text.x = element_text(size = 11))
+ggsave("Manuscript_bioxiv/Figures/dump/relative_info_flow_amtcell_hiv_pos_neg_0hrs.pdf", width = 6, height = 9)
+```
+
+#cellchat network figures
+```{r}
+cellchat_hivneg4hrs <- readRDS("rds_data/cellchat_hivneg4hrs_amtcell.rds")
+
+for (i in cellchat_hivneg4hrs@netP$pathways) {
+  LRfilename <- paste(unname(unlist(extractEnrichedLR(cellchat_hivneg4hrs, signaling = i))), collapse = "_")
+  pdf(paste("Manuscript_bioxiv/Figures/dump/Cellchat/HC+Mtb/", i,"_",LRfilename, ".pdf", sep = ""), width = 6, height = 6)
+  netVisual_aggregate(cellchat_hivneg4hrs, signaling = i, layout = "circle", arrow.size = 0.4, signaling.name = i) 
+  dev.off()
+}
+
+
+cellchat_hivpos4hrs <- readRDS("rds_data/cellchat_hiv4hrs_amtcells.rds")
+
+for (i in cellchat_hivpos4hrs@netP$pathways) {
+  LRfilename <- paste(unname(unlist(extractEnrichedLR(cellchat_hivpos4hrs, signaling = i))), collapse = "_")
+  pdf(paste("Manuscript_bioxiv/Figures/dump/Cellchat/PLWH+Mtb/", i,"_",LRfilename, ".pdf", sep = ""), width = 6, height = 6)
+  netVisual_aggregate(cellchat_hivpos4hrs, signaling = i, layout = "circle", arrow.size = 0.4, signaling.name = i) 
+  dev.off()
+}
+
+
+```
+
+# All celltypes cellchat
+```{r}
+object_list <- readRDS("rds_data/cellchat_objectlist_hiv_pos_neg_4hrs.rds")
+
+cellchat_hivneg4hrs <- object_list[[1]]
+cellchat_hivpos4hrs <- object_list[[2]]
+
+```
+```{r}
+pdf("Manuscript_bioxiv/Figures/dump/Cellchat_IL6.pdf", width = 4, height = 4)
+netVisual_aggregate(cellchat_hivneg4hrs, signaling = "IL6", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.6, vertex.label.cex = 1, margin = 0)
+dev.off()
+
+pdf("Manuscript_bioxiv/Figures/dump/Cellchat_CD86.pdf", width = 4, height = 4)
+netVisual_aggregate(cellchat_hivneg4hrs, signaling = "CD86", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.6, vertex.label.cex = 1, margin = 0)
+dev.off()
+
+pdf("Manuscript_bioxiv/Figures/dump/CellChat_TNF.pdf", width = 4, height = 4)
+netVisual_aggregate(cellchat_hivneg4hrs, signaling = "TNF", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.6, vertex.label.cex = 1, margin = 0)
+dev.off()
+
+pdf("Manuscript_bioxiv/Figures/dump/CellChat_APRIL.pdf", width = 4, height = 4)
+netVisual_aggregate(cellchat_hivneg4hrs, signaling = "APRIL", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.6, vertex.label.cex = 1, margin = 0)
+dev.off()
+```
+```{r}
+pdf("Manuscript_bioxiv/Figures/dump/Cellchat_LIGHT.pdf", width = 4, height = 4)
+netVisual_aggregate(cellchat_hivpos4hrs, signaling = "LIGHT", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.6, vertex.label.cex = 1, margin = 0)
+dev.off()
+
+pdf("Manuscript_bioxiv/Figures/dump/Cellchat_CD39.pdf", width = 4, height = 4)
+netVisual_aggregate(cellchat_hivpos4hrs, signaling = "CD39", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.6, vertex.label.cex = 1, margin = 0)
+dev.off()
+
+pdf("Manuscript_bioxiv/Figures/dump/Cellchat_CSF.pdf", width = 4, height = 4)
+netVisual_aggregate(cellchat_hivpos4hrs, signaling = "CSF", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.6, vertex.label.cex = 1, margin = 0)
+dev.off()
+
+pdf("Manuscript_bioxiv/Figures/dump/Cellchat_SPP1.pdf", width = 4, height = 4)
+netVisual_aggregate(cellchat_hivpos4hrs, signaling = "SPP1", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.6, vertex.label.cex = 1, margin = 0)
+dev.off()
+```

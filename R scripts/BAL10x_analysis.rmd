@@ -1,0 +1,1175 @@
+---
+title: "KK_BAL10x"
+author: "Prashant"
+date: "2022-10-31"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(reshape2)
+library(dplyr)
+library(readxl)
+library(writexl)
+library(patchwork)
+library(Seurat)
+library(tibble)
+library(DoubletFinder)
+library(tidyr)
+library(RColorBrewer)
+library(msigdbr)
+library(fgsea)
+library(stringr)
+library(harmony)
+source('/Users/pbajpai/Documents/Rthemes/theme_publication.R')
+source("helper_funs.R")
+```
+
+load analysed data
+```{r}
+balVer2 <- readRDS("rds_data/balver2.rds")
+balVer2$label.main2 <- factor(balVer2$label.main2, levels = c("AM", "MDM", "Neutrophils", "DC", "Monocyte", "CD4 T cell", "CD8 T cell", "Tgd", "T reg", "B cell", "NK cell", "Epithelial cells"))
+cols <- c("#386cb0","#fdb462","#7fc97f","#ef3b2c","#662506","#a6cee3",
+         "#fb9a99","#6A3D9A","#F6DF07", "#F0027F","#BF5B17", "#666666",
+         "#33A02C", "#FF7F00", "#E78AC3")
+#topTables_DE_pos_neg_4hrs <- readRDS("rds_data/topTables_DE_pos_neg_4hrs.rds")
+#topTables_DE_pos_neg_0hrs <- readRDS("rds_data/topTables_DE_pos_neg_0hrs.rds")
+```
+
+#global DEG analysis
+```{r}
+Idents(balVer2) <- "hiv_timepoint"
+plan('multisession')
+topTables_hivneg_pos_neg_4hr_global <- FindMarkers(balVer2, ident.1 = "POS 4hrs", ident.2 = "NEG 4hrs", test.use = 'MAST', only.pos = F, min.pct = 0, logfc.threshold = 0)
+
+saveRDS(topTables_hivneg_pos_neg_4hr_global, "rds_data/topTables_hivneg_pos_neg_4hr_global.rds")
+```
+
+```{r}
+library(ggpubr)
+plotdat <- topTables_hivneg_pos_neg_4hr_global %>% rownames_to_column("GeneID")
+
+test <- AverageExpression(balVer2, group.by = "orig.ident")[[1]]
+test <- as.data.frame(test)
+test$log2exp <- log2(test$all + 1)
+test <- test %>% rownames_to_column("GeneID")
+
+plotdat <- merge(plotdat, test, by = "GeneID")
+plotdat <- plotdat[c("GeneID", "avg_log2FC", "p_val_adj", "log2exp")]
+#topTables_global <- topTables_global %>% column_to_rownames("GeneID")
+colnames(plotdat) <- c("GeneID","log2FoldChange", "padj", "baseMeanLog2")
+
+
+set.seed(101010)
+ggmaplot(plotdat, fdr = 0.05, fc = 1.3, size = 1.5, palette = c("#B31B21", "#1465AC", "darkgray"), genenames = as.vector(plotdat$GeneID), legend = "top", top = 0, label.select = "TNF", font.label = c("bold", 14), label.rectangle = TRUE, font.legend = "bold", font.main = "bold", ggtheme = ggplot2::theme_minimal(), alpha = 0.8) + scale_y_continuous(limits = c(-2.3, 2.3)) + scale_x_continuous(limits = c(0,7.3)) + theme(axis.text.x = element_text(color = "black", size = 12), axis.text.y = element_text(color = "black", size = 12), axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12), legend.text = element_text(size = 16)) +  guides(colour = guide_legend(override.aes = list(size=10)))
+
+ggsave("Manuscript_bioxiv/Figures/dump/MAplot_global.png", width = 8, height = 4, units = "in")
+```
+
+#Prepare msigdb data
+```{r}
+all_gene_sets = msigdbr(species = "Homo sapiens")
+#all_gene_sets = all_gene_sets[all_gene_sets$gs_cat %in% c('C2','C5','H'),]
+gene_subcats = sapply(all_gene_sets$gs_name, function(x){
+  out = gsub('_.*', '', x)
+  out = gsub('(GSE).*', '\\1', out)
+}, USE.NAMES = F)
+```
+
+#cell subset frequencies
+```{r}
+FreqTable_labelmain <- data.frame("samplename_time" = balVer2$samplename_time, "label.main2" = balVer2$label.main2, "Groups" = balVer2$hiv_timepoint) %>% 
+  group_by(samplename_time, label.main2, Groups) %>% 
+  summarise(n_cells = n()) %>% 
+  ungroup() %>% 
+  spread(label.main2, n_cells, fill = 0)
+
+#write_xlsx(list("LabelMain" = FreqTable_labelmain, "LabelFine" = FreqTable_labelfine), "supply files/cell_frequency_fil_label_main_fine.xlsx")
+
+plotdat <- melt(FreqTable_labelmain, id.vars = c("samplename_time", "Groups")) %>%
+  group_by(samplename_time, Groups) %>%
+  mutate(perc = 100 * value/sum(value)) %>%
+  ungroup()
+plotdat$Groups <- factor(plotdat$Groups, levels = c("NEG 0hrs", "POS 0hrs", "NEG 4hrs", "POS 4hrs"))
+
+plotlist <- split(plotdat, f = plotdat$variable)
+comparisons <- list(c("NEG 0hrs", "POS 0hrs"), c("NEG 4hrs", "POS 4hrs"), c("NEG 0hrs", "NEG 4hrs"), c("POS 0hrs", "POS 4hrs"))
+library(ggbeeswarm)
+library(ggpubr)
+
+lapply(seq_along(plotlist), function(i){
+  x = plotlist[[i]]
+  set.seed(101010)
+  ggplot(x, aes(x = Groups, y = perc)) + 
+    geom_quasirandom(shape = 21) + 
+    geom_boxplot(outlier.shape = NA, color = "grey", alpha = 0.1, width = 0.5) +
+    stat_compare_means(comparisons = comparisons, size = 5, vjust = 0.2, bracket.size = 0.1, tip.length = 0.02) +
+    ylab("% of total cells") + xlab("") +
+    theme_Publication() + 
+    theme(axis.text.x = element_blank(),
+          axis.text.y = element_text(size = 14),
+          axis.title.y = element_blank())
+  ggfile <- paste("Figures/Iter3/annotation/cellfreq_", names(plotlist)[i], ".pdf", sep = "")
+  ggsave(ggfile, width = 3.5, height = 4, units = "in")
+  return(NULL)
+})
+```
+
+
+#global heatmap
+```{r}
+library(ComplexHeatmap)
+library(circlize)
+
+plotdat <- balVer2
+plotdat$main_group <- paste(plotdat$label.main2, plotdat$hiv_timepoint, sep = "_")
+Idents(plotdat) <- "main_group"
+
+goi1 <- lapply(topTables_DE_pos_neg_4hrs, function(x){
+  #x <- x[abs(x$avg_log2FC) > 0.2 & x$p_val_adj < 1,]
+  x <- x[abs(x$avg_log2FC) > 0.378 & x$p_val_adj < 0.05,]
+  if(nrow(x) >= 10){
+    x$abslog <- abs(x$avg_log2FC)
+    x <- x[order(x$abslog, decreasing = T),]
+    x <- x[1:10,]
+  }
+  return(x)
+})
+
+goi1 <- bind_rows(goi1, .id = "celltype")
+
+goi2 <- lapply(topTables_DE_pos_neg_0hrs, function(x){
+  #x <- x[abs(x$avg_log2FC) > 0.2 & x$p_val_adj < 1,]
+  x <- x[abs(x$avg_log2FC) > 0.378 & x$p_val_adj < 0.05,]
+  if(nrow(x) >= 10){
+    x$abslog <- abs(x$avg_log2FC)
+    x <- x[order(x$abslog, decreasing = T),]
+    x <- x[1:10,]
+  }
+  return(x)
+})
+goi2 <- bind_rows(goi2, .id = "celltype")
+
+goi <- rbind(goi1, goi2)
+goi <- goi[!duplicated(goi$GeneID),]
+
+#select top 100 genes
+#goi <- goi[order(goi$p_val),][1:100,]
+
+average_expr <- AverageExpression(plotdat, group.by = "main_group", return.seurat = T, slot = "counts", add.ident = "main_group")
+
+mat <- average_expr[["RNA"]]@data[goi$GeneID, ] %>% as.matrix()
+colnames(mat) <- sub('^([^_]+_[^_]+).*', '\\1', colnames(mat))
+#mat <- mat[,grep("Uninfected", colnames(mat), invert = T)]
+mat <- mat[, c("AM_NEG 0hrs", "AM_POS 0hrs", "AM_NEG 4hrs", "AM_POS 0hrs", "MDM_NEG 0hrs", "MDM_POS 0hrs", "MDM_NEG 4hrs", "MDM_POS 4hrs", "Neutrophils_NEG 0hrs", "Neutrophils_POS 0hrs", "Neutrophils_NEG 4hrs", "Neutrophils_POS 4hrs", "DC_NEG 0hrs", "DC_POS 0hrs", "DC_NEG 4hrs", "DC_POS 4hrs", "Monocyte_NEG 0hrs", "Monocyte_POS 0hrs", "Monocyte_NEG 4hrs", "Monocyte_POS 4hrs", "CD4 T cell_NEG 0hrs", "CD4 T cell_POS 0hrs", "CD4 T cell_NEG 4hrs", "CD4 T cell_POS 4hrs", "CD8 T cell_NEG 0hrs", "CD8 T cell_POS 0hrs", "CD8 T cell_NEG 4hrs", "CD8 T cell_POS 4hrs", "Tgd_NEG 0hrs", "Tgd_POS 0hrs", "Tgd_NEG 4hrs", "Tgd_POS 4hrs", "T reg_NEG 0hrs", "T reg_POS 0hrs", "T reg_NEG 4hrs", "T reg_POS 4hrs", "B cell_NEG 0hrs", "B cell_POS 0hrs", "B cell_NEG 4hrs", "B cell_POS 4hrs", "NK cell_NEG 0hrs", "NK cell_POS 0hrs", "NK cell_NEG 4hrs", "NK cell_POS 4hrs", "Epithelial cells_NEG 0hrs", "Epithelial cells_POS 0hrs", "Epithelial cells_NEG 4hrs", "Epithelial cells_POS 4hrs")]
+
+mat <- t(scale(t(mat)))
+#cluster_anno <- factor(colnames(mat), levels = colnames(mat))
+col_fun = circlize::colorRamp2(c(-1, 0, 2), c("blue", "white", "red"))
+
+cols <- c("#386cb0","#fdb462","#7fc97f","#ef3b2c","#662506","#a6cee3",
+          "#fb9a99","#6A3D9A","#F6DF07", "#F0027F","#BF5B17", "#666666",
+          "#33A02C", "#FF7F00", "#E78AC3")
+cols = c("#386cb0","#fdb462","#7fc97f","#ef3b2c","#662506","#a6cee3",
+         "#fb9a99","#6A3D9A", "#F6DF07", "#F0027F","#BF5B17", "#666666")
+anno_df <- data.frame(label = colnames(mat), 
+                      Cells = gsub("_.*", "", colnames(mat)),
+                      Group = gsub(".*_", "", colnames(mat)))
+#anno_df <- anno_df %>% arrange(cells, desc(group))
+#cluster_anno <- factor(unique(anno_df$cells), levels = unique(anno_df$cells))
+anno_df$Cells <- factor(anno_df$Cells, levels = unique(anno_df$Cells))
+anno_df$Group <- factor(anno_df$Group, levels = c("NEG 0hrs", "POS 0hrs", "NEG 4hrs", "POS 4hrs"))
+
+colcells <- cols
+names(colcells) <- unique(anno_df$Cells)
+colcells <- factor(colcells, levels = cols)
+
+ha = HeatmapAnnotation(df = anno_df[,2:3], col = list(Cells = colcells, Group = c("NEG 0hrs" = "#F6DF07", "POS 0hrs" = "#BF5B17", "NEG 4hrs" = "#33A02C", "POS 4hrs" = "red")), annotation_name_side = "left", annotation_legend_param = list(labels_gp = gpar(fontsize = 14), title_gp = gpar(fontsize = 16, fontface = "bold")), show_annotation_name = F)
+
+test <- hclust(dist(mat), method = "ward.D2")
+test <- as.dendrogram(test)
+test <- reorder(test, rev(order.dendrogram(test)))
+row_dend = dendsort(hclust(dist(mat), method = "ward.D2"))
+
+pdf("Figures/Iter3/heatmap/global_heatmap_t10_pergroup.pdf", width = 14, height = 20)
+Heatmap(mat, name = "Expression",  
+        #column_split = cluster_anno,
+        cluster_columns = FALSE,
+        show_column_dend = FALSE,
+        cluster_column_slices = TRUE,
+        column_title_gp = gpar(fontsize = 16),
+        column_gap = unit(0, "mm"),
+        cluster_rows = T,
+        row_dend_reorder = T,
+        show_row_dend = T,
+        clustering_method_rows = "ward.D2",
+        col = col_fun,
+        row_names_gp = gpar(fontsize = 14),
+        column_title_rot = 60,
+        heatmap_legend_param = list(labels_gp = gpar(fontsize = 14), title_gp = gpar(fontsize = 16, fontface = "bold"), legend_direction = "horizontal"),
+        top_annotation = ha,
+        show_column_names = F,
+        show_row_names = T,
+        use_raster = FALSE,
+        raster_quality = 4)
+dev.off()
+```
+
+```{r}
+p1 <- VlnPlot(balVer2, group.by = "label.main2", features = "CD40", cols = cols) + theme(legend.position = "bottom", legend.direction = "horizontal") +
+  guides(fill=guide_legend(nrow=3,byrow=TRUE))
+p1 <- get_legend(p1)
+p1 <- as_ggplot(p1)
+ggsave("Figures/Iter3/legends/heatmap_legend_horizontal_3col.pdf", p1, width = 5.2, height = 1, units = "in")
+```
+
+#Alluvial plots
+```{r}
+library(ggalluvial)
+alluv_4hrs <- bind_rows(topTables_DE_pos_neg_4hrs, .id = "celltype")
+alluv_0hrs <- bind_rows(topTables_DE_pos_neg_0hrs, .id = "celltype")
+
+alluv_4hrs <- topTables_DE_pos_neg_4hrs[[1]]
+alluv_0hrs <- topTables_DE_pos_neg_0hrs[[1]]
+
+alluv_4hrs$res <- ifelse(alluv_4hrs$avg_log2FC > 0.378 & alluv_4hrs$p_val_adj <= 0.05, "up-reg", ifelse(alluv_4hrs$avg_log2FC < -0.378 & alluv_4hrs$p_val_adj <= 0.05, "down-reg", "no-change"))
+#alluv_4hrs$res <- paste(alluv_4hrs$res, alluv_4hrs$celltype, sep = " ")
+alluv_4hrs <- alluv_4hrs[c("GeneID", "res")]
+alluv_4hrs$group <- "4hrs"
+
+alluv_0hrs$res <- ifelse(alluv_0hrs$avg_log2FC > 0.378 & alluv_0hrs$p_val_adj <= 0.05, "up-reg", ifelse(alluv_0hrs$avg_log2FC < -0.378 & alluv_0hrs$p_val_adj <= 0.05, "down-reg", "no-change"))
+#alluv_0hrs$res <- paste(alluv_0hrs$res, alluv_0hrs$celltype, sep = " ")
+alluv_0hrs <- alluv_0hrs[c("GeneID", "res")]
+alluv_0hrs$group <- "0hrs"
+
+#remove some unchaged genes
+to_remove <- intersect(alluv_4hrs[alluv_4hrs$res == "no-change",]$GeneID, 
+                       alluv_0hrs[alluv_0hrs$res == "no-change",]$GeneID)
+to_remove <- to_remove[1:35000]
+
+plotdat <- rbind(alluv_0hrs, alluv_4hrs)
+plotdat$group <- factor(plotdat$group, levels = c("0hrs", "4hrs"))
+plotdat <- plotdat[!plotdat$GeneID %in% to_remove,]
+
+ggplot(plotdat, aes(x = group, stratum = res, alluvium = GeneID, fill = res, label = res)) + geom_flow(stat = "alluvium") + geom_stratum(color = NA) + theme_void() + scale_fill_manual(values = c("#377eb8", "grey", "#e41a1c")) + theme(legend.position = "none")
+
+custum.alluv <- function(data_4hrs, data_0hrs){
+  data_4hrs$res <- ifelse(data_4hrs$avg_log2FC > 0.378 & data_4hrs$p_val_adj <= 0.05, "up-reg", ifelse(data_4hrs$avg_log2FC < -0.378 & data_4hrs$p_val_adj <= 0.05, "down-reg", "no-change"))
+  data_4hrs <- data_4hrs[c("GeneID", "res")]
+  data_4hrs$group <- "4hrs"
+  print(table(data_4hrs$res))
+  
+  data_0hrs$res <- ifelse(data_0hrs$avg_log2FC > 0.378 & data_0hrs$p_val_adj <= 0.05, "up-reg", ifelse(data_0hrs$avg_log2FC < -0.378 & data_0hrs$p_val_adj <= 0.05, "down-reg", "no-change"))
+  data_0hrs <- data_0hrs[c("GeneID", "res")]
+  data_0hrs$group <- "0hrs"
+  print(table(data_0hrs$res))
+  #remove some unchaged genes
+  to_remove <- intersect(data_4hrs[data_4hrs$res == "no-change",]$GeneID, 
+                         data_0hrs[data_0hrs$res == "no-change",]$GeneID)
+  to_remove <- to_remove[1:35000]
+  
+  plotdat <- rbind(data_0hrs, data_4hrs)
+  plotdat$group <- factor(plotdat$group, levels = c("0hrs", "4hrs"))
+  plotdat <- plotdat[!plotdat$GeneID %in% to_remove,]
+  
+  p1 <- ggplot(plotdat, aes(x = group, stratum = res, alluvium = GeneID, fill = res, label = res)) + geom_flow(stat = "alluvium", width = 0.1) + geom_stratum(color = NA, width = 0.2) + theme_void() + scale_fill_manual(values = c("#377eb8", "grey", "#e41a1c")) + theme(legend.position = "none")
+  return(p1)
+}
+
+custum.alluv(data_4hrs = topTables_DE_pos_neg_4hrs$`T cells:CD4`,
+             data_0hrs = topTables_DE_pos_neg_0hrs$`T cells:CD4`)
+ggsave("Figures/Iter3/alluvial/tcells_cd4.pdf", width = 3, height = 2, units = "in")
+
+custum.alluv(data_4hrs = topTables_DE_pos_neg_4hrs$`T cells:CD8`,
+             data_0hrs = topTables_DE_pos_neg_0hrs$`T cells:CD8`)
+ggsave("Figures/Iter3/alluvial/tcells_cd8.pdf", width = 4, height = 2, units = "in")
+
+custum.alluv(data_4hrs = topTables_DE_pos_neg_4hrs$Macrophage,
+             data_0hrs = topTables_DE_pos_neg_0hrs$Macrophage)
+ggsave("Figures/Iter3/alluvial/macrophage.pdf", width = 4, height = 2, units = "in")
+
+custum.alluv(data_4hrs = topTables_DE_pos_neg_4hrs$DC,
+             data_0hrs = topTables_DE_pos_neg_0hrs$DC)
+ggsave("Figures/Iter3/alluvial/DC.pdf", width = 4, height = 2, units = "in")
+
+custum.alluv(data_4hrs = topTables_DE_pos_neg_4hrs$Monocyte,
+             data_0hrs = topTables_DE_pos_neg_0hrs$Monocyte)
+ggsave("Figures/Iter3/alluvial/monocytes.pdf", width = 4, height = 2, units = "in")
+
+custum.alluv(data_4hrs = topTables_DE_pos_neg_4hrs$`NK cell`,
+             data_0hrs = topTables_DE_pos_neg_0hrs$`NK cell`)
+ggsave("Figures/Iter3/alluvial/NK.pdf", width = 4, height = 2, units = "in")
+
+```
+
+```{r}
+cols <- c("#386cb0","#fdb462","#7fc97f","#ef3b2c","#662506","#a6cee3",
+         "#fb9a99","#6A3D9A","#F6DF07", "#F0027F","#BF5B17", "#666666",
+         "#33A02C", "#FF7F00", "#E78AC3")
+```
+
+```{r}
+library(ggpubr)
+plotdat_AM <- topTables_DE_pos_neg_4hrs$Macrophage 
+
+test <- AverageExpression(balVer2, group.by = "label.main2")[[1]]
+test <- as.data.frame(test)
+test$log2exp <- log2(test$AM + 1)
+test <- test %>% rownames_to_column("GeneID")
+
+plotdat_AM <- merge(plotdat_AM, test, by = "GeneID")
+plotdat_AM <- plotdat_AM[c("GeneID", "avg_log2FC", "p_val_adj", "log2exp")]
+#topTables_global <- topTables_global %>% column_to_rownames("GeneID")
+colnames(plotdat_AM) <- c("GeneID","log2FoldChange", "padj", "baseMeanLog2")
+
+
+set.seed(101010)
+ggmaplot(plotdat_AM, fdr = 0.05, fc = 1.3, size = 1.2, palette = c("#B31B21", "#1465AC", "darkgray"), genenames = as.vector(plotdat_AM$GeneID), legend = "top", top = 0, font.label = c("bold", 10), label.rectangle = TRUE, font.legend = "bold", font.main = "bold", ggtheme = ggplot2::theme_minimal(), label.select = c("APOC1", "CXCL8", "CXCL3", "CCL4", "HLA-DRB5", "SOD2", "CXCL2", "HLA-DQA1", "IL1B", "MARCO", "JUN", "TNF", "NFKBIA", "BCL2A1", "CXCL5", "TNFAIP6", "LAIR1", "IL1A", "TGFB1", "IL6", "CXCL1", "IL32", "IL23A", "CXCL10", "CCR7", "IFNG", "IL2")) + scale_y_continuous(limits = c(-3.2, 2)) + scale_x_continuous(limits = c(0,6)) + theme(axis.text.x = element_text(color = "black", size = 10), axis.text.y = element_text(color = "black", size = 10), legend.text = element_text(size = 14))
+
+ggsave("Figures/Iter3/Volcano/Macrophage_4hrs.png", width = 8, height = 6, units = "in")
+```
+
+```{r}
+plotdat_cd4 <- topTables_DE_pos_neg_4hrs$`T cells:CD4` 
+
+test <- AverageExpression(balVer2, group.by = "label.main2")[[1]]
+test <- as.data.frame(test)
+test$log2exp <- log2(test$`CD4 T cell` + 1)
+test <- test %>% rownames_to_column("GeneID")
+
+plotdat_cd4 <- merge(plotdat_cd4, test, by = "GeneID")
+plotdat_cd4 <- plotdat_cd4[c("GeneID", "avg_log2FC", "p_val_adj", "log2exp")]
+#topTables_global <- topTables_global %>% column_to_rownames("GeneID")
+colnames(plotdat_cd4) <- c("GeneID","log2FoldChange", "padj", "baseMeanLog2")
+
+
+set.seed(101010)
+ggmaplot(plotdat_cd4, fdr = 0.05, fc = 1.3, size = 1.2, palette = c("#B31B21", "#1465AC", "darkgray"), genenames = as.vector(plotdat_cd4$GeneID), legend = "top", top = 0, font.label = c("bold", 10), label.rectangle = TRUE, font.legend = "bold", font.main = "bold", ggtheme = ggplot2::theme_minimal(), label.select = c("HLA-A", "MT-ATP8", "CD74", "IL7R", "HLA-DRA", "CCL4", "CXCL8", "CXCR4", "CXCL3", "CD63", "IL1B", "GZMA", "BCL2", "GZMB", "IL10RA", "TRAF1", "CD83", "MARCO", "TNFSF14", "CXCL5", "TNFAIP6", "IFNGR2", "CD86")) + scale_y_continuous(limits = c(-4, 2.5)) + scale_x_continuous(limits = c(0,7.5)) + theme(axis.text.x = element_text(color = "black", size = 10), axis.text.y = element_text(color = "black", size = 10), legend.text = element_text(size = 14))
+
+ggsave("Figures/Iter3/Volcano/CD4T_4hrs.png", width = 8, height = 6, units = "in")
+```
+
+```{r}
+plotdat_cd8 <- topTables_DE_pos_neg_4hrs$`T cells:CD8` 
+
+test <- AverageExpression(balVer2, group.by = "label.main2")[[1]]
+test <- as.data.frame(test)
+test$log2exp <- log2(test$`CD8 T cell` + 1)
+test <- test %>% rownames_to_column("GeneID")
+
+plotdat_cd8 <- merge(plotdat_cd8, test, by = "GeneID")
+plotdat_cd8 <- plotdat_cd8[c("GeneID", "avg_log2FC", "p_val_adj", "log2exp")]
+#topTables_global <- topTables_global %>% column_to_rownames("GeneID")
+colnames(plotdat_cd8) <- c("GeneID","log2FoldChange", "padj", "baseMeanLog2")
+
+
+set.seed(101010)
+ggmaplot(plotdat_cd8, fdr = 0.05, fc = 1.3, size = 1.2, palette = c("#B31B21", "#1465AC", "darkgray"), genenames = as.vector(plotdat_cd8$GeneID), legend = "top", top = 0, font.label = c("bold", 10), label.rectangle = TRUE, font.legend = "bold", font.main = "bold", ggtheme = ggplot2::theme_minimal(), label.select = c("CCL5", "MT-ATP8", "CD74", "CD99", "GNLY", "CCL4", "CXCL8", "CXCR4", "CXCL3", "HLA-DRB1", "IFNG", "XCL1", "TNF", "GZMB", "IL2", "STAT1", "CD68", "MARCO", "TNFSF14", "TNFSF9", "CXCL5", "CD40LG")) + scale_y_continuous(limits = c(-2.5, 3.5)) + scale_x_continuous(limits = c(0,7.5)) + theme(axis.text.x = element_text(color = "black", size = 10), axis.text.y = element_text(color = "black", size = 10), legend.text = element_text(size = 14))
+
+ggsave("Figures/Iter3/Volcano/CD8T_4hrs.png", width = 8, height = 6, units = "in")
+```
+
+```{r}
+plotdat_nk <- topTables_DE_pos_neg_4hrs$`NK cell`
+
+test <- AverageExpression(balVer2, group.by = "label.main2")[[1]]
+test <- as.data.frame(test)
+test$log2exp <- log2(test$`NK cell` + 1)
+test <- test %>% rownames_to_column("GeneID")
+
+plotdat_nk <- merge(plotdat_nk, test, by = "GeneID")
+plotdat_nk <- plotdat_nk[c("GeneID", "avg_log2FC", "p_val_adj", "log2exp")]
+#topTables_global <- topTables_global %>% column_to_rownames("GeneID")
+colnames(plotdat_nk) <- c("GeneID","log2FoldChange", "padj", "baseMeanLog2")
+
+
+set.seed(101010)
+ggmaplot(plotdat_nk, fdr = 0.05, fc = 1.3, size = 1.2, palette = c("#B31B21", "#1465AC", "darkgray"), genenames = as.vector(plotdat_nk$GeneID), legend = "top", top = 0, font.label = c("bold", 10), label.rectangle = TRUE, font.legend = "bold", font.main = "bold", ggtheme = ggplot2::theme_minimal(), label.select = c("CCL4", "GNLY", "CD74", "MT-ATP8", "S100A6", "IL32", "IFNG", "XCL2", "TNF", "HLA-DRA", "IL2", "CD52", "CXCR4", "CXCL8", "NR4A1", "IRF7", "STAT1", "CD40LG", "NFKBID", "IL21", "NR4A3", "TFRC")) + scale_y_continuous(limits = c(-3.7, 4.1)) + scale_x_continuous(limits = c(0,7.5)) + theme(axis.text.x = element_text(color = "black", size = 10), axis.text.y = element_text(color = "black", size = 10), legend.text = element_text(size = 14))
+
+ggsave("Figures/Iter3/Volcano/NK_4hrs.png", width = 8, height = 6, units = "in")
+```
+
+```{r}
+library(pathview)
+library(biomaRt)
+
+genelist <- lapply(topTables_DE_pos_neg_4hrs, function(x){
+  out <- ref.genelist(x)
+})
+
+
+pathview(gene.data  = genelist$Macrophage, pathway.id = "hsa04668", species = "human",limit = list(gene=1, cpd=1))
+```
+
+#AM subset
+```{r}
+am <- subset(balVer2, subset = label.main2 == "AM")
+
+am <- FindVariableFeatures(am, verbose = F)
+am <- ScaleData(am, verbose = F)
+am <- NormalizeData(am,  verbose = F)
+am <- RunPCA(am, verbose = F, npcs = 20)
+ElbowPlot(am)
+am <- RunUMAP(am, dims = 1:15, verbose = F)
+am <- FindNeighbors(am, dims = 1:15)
+am <- FindClusters(am, resolution = 0.05)
+
+#label am subsets
+label.subset <- am@meta.data %>%
+  select(seurat_clusters) %>%
+  mutate(label.subset = ifelse(seurat_clusters == 0, "AM 1", ifelse(seurat_clusters == 1, "AM 2", ifelse(seurat_clusters == 2, "AM 3", ifelse(seurat_clusters == 3, "AM 4", "AM 5"))))) %>%
+  select(label.subset)
+label.subset$label.subset <- factor(label.subset$label.subset, 
+                                    levels = c("AM 1", "AM 2", "AM 3", "AM 4", "AM 5"))
+
+am <- AddMetaData(am, metadata = label.subset)
+Idents(am) <- "label.subset"
+topmarkersPercluster <- lapply(unique(am$label.subset), function(x){
+  message(paste("running subset:", x, sep = ""))
+  cluster_marker <- FindMarkers(am, ident.1 = x, min.pct = 0.25, only.pos = T)
+  cluster_marker <- cluster_marker %>% rownames_to_column("GeneID")
+})
+names(topmarkersPercluster) <- paste("Cluster",unique(am$label.subset))
+
+entrez_genes <- mapIds(org.Hs.eg.db, keys = unique(topmarkersPercluster),column = "ENTREZID", keytype = "SYMBOL")
+out_hivpos_unique <- enrichPathway(gene = entrez_genes)
+out_hivpos_unique <- out_hivpos_unique@result
+```
+
+#cellchat
+```{r}
+object_list <- readRDS("rds_data/cellchat_objectlist_hiv_pos_neg_4hrs.rds")
+
+cellchat_hivneg4hrs <- object_list[[1]]
+cellchat_hivpos4hrs <- object_list[[2]]
+
+netVisual_aggregate(cellchat_hivneg4hrs, signaling = "CD39", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.4, vertex.label.cex = 1)
+netVisual_aggregate(cellchat_hivpos4hrs, signaling = "VEGF", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.4, vertex.label.cex = 1)
+
+netAnalysis_contribution(cellchat_hivpos4hrs, signaling = "CCL")
+
+plotGeneExpression(cellchat_hivneg4hrs, signaling = "TNF")
+```
+
+```{r}
+pdf("Figures/Iter3/Cellchat/HIV_neg_4hrs/IL6.pdf", width = 6, height = 6)
+netVisual_aggregate(cellchat_hivneg4hrs, signaling = "IL6", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.4, vertex.label.cex = 1)
+dev.off()
+
+pdf("Figures/Iter3/Cellchat/HIV_neg_4hrs/CD86.pdf", width = 6, height = 6)
+netVisual_aggregate(cellchat_hivneg4hrs, signaling = "CD86", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.4, vertex.label.cex = 1)
+dev.off()
+
+pdf("Figures/Iter3/Cellchat/HIV_neg_4hrs/APRIL.pdf", width = 6, height = 6)
+netVisual_aggregate(cellchat_hivneg4hrs, signaling = "APRIL", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.4, vertex.label.cex = 1)
+dev.off()
+```
+
+```{r}
+pdf("Figures/Iter3/Cellchat/HIV_pos_4hrs/VEGF.pdf", width = 6, height = 6)
+netVisual_aggregate(cellchat_hivpos4hrs, signaling = "VEGF", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.4, vertex.label.cex = 1)
+dev.off()
+
+pdf("Figures/Iter3/Cellchat/HIV_pos_4hrs/CD39.pdf", width = 6, height = 6)
+netVisual_aggregate(cellchat_hivpos4hrs, signaling = "CD39", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.4, vertex.label.cex = 1)
+dev.off()
+
+pdf("Figures/Iter3/Cellchat/HIV_pos_4hrs/CSF.pdf", width = 6, height = 6)
+netVisual_aggregate(cellchat_hivpos4hrs, signaling = "CSF", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.4, vertex.label.cex = 1)
+dev.off()
+
+pdf("Figures/Iter3/Cellchat/HIV_pos_4hrs/SPP1.pdf", width = 6, height = 6)
+netVisual_aggregate(cellchat_hivpos4hrs, signaling = "SPP1", layout = "circle", pt.title = 2, title.space = 0, arrow.size = 0.4, vertex.label.cex = 1)
+dev.off()
+```
+
+#pathview
+```{r}
+library(pathview)
+library(biomaRt)
+
+genelist <- lapply(topTables_macro, function(x){
+  out <- ref.genelist(x)
+})
+
+
+pathview(gene.data  = genelist$`AM 1`, pathway.id = "hsa04668", species = "human",limit = list(gene=1, cpd=1), kegg.dir = "Figures/Iter3/pathview/macro/AM1/")
+
+pathview(gene.data  = genelist$`AM 2`, pathway.id = "hsa04668", species = "human",limit = list(gene=1, cpd=1), kegg.dir = "Figures/Iter3/pathview/macro/AM2/")
+
+pathview(gene.data  = genelist$`AM 3`, pathway.id = "hsa04668", species = "human",limit = list(gene=1, cpd=1), kegg.dir = "Figures/Iter3/pathview/macro/AM3/")
+
+pathview(gene.data  = genelist$`AM 4`, pathway.id = "hsa04668", species = "human",limit = list(gene=1, cpd=1), kegg.dir = "Figures/Iter3/pathview/macro/AM4/")
+
+pathview(gene.data  = genelist$`AM 5`, pathway.id = "hsa04668", species = "human",limit = list(gene=1, cpd=1), kegg.dir = "Figures/Iter3/pathview/macro/AM5/")
+
+pathview(gene.data  = genelist$`T cells:CD4`, pathway.id = "hsa04668", species = "human",limit = list(gene=1, cpd=1), kegg.dir = "Figures/Iter3/pathview/cd4/")
+
+pathview(gene.data  = genelist$`T cells:CD8`, pathway.id = "hsa04668", species = "human",limit = list(gene=1, cpd=1), kegg.dir = "Figures/Iter3/pathview/cd8/")
+
+pathview(gene.data  = genelist$`AM 1`, pathway.id = "hsa04657", species = "human",limit = list(gene=1, cpd=1), kegg.dir = "Figures/Iter3/pathview/macro/AM1/")
+
+pathview(gene.data  = genelist$`AM 1`, pathway.id = "hsa04064", species = "human",limit = list(gene=1, cpd=1), kegg.dir = "Figures/Iter3/pathview/macro/AM1/")
+
+pathview(gene.data  = genelist$`AM 1`, pathway.id = "hsa00190", species = "human",limit = list(gene=1, cpd=1), kegg.dir = "Figures/Iter3/pathview/macro/AM1/")
+```
+
+#pathview 0hrs
+```{r}
+library(pathview)
+library(biomaRt)
+
+ref.genelist = function(genes){
+  genenames = genes$GeneID
+  genenames <- stringr::str_to_upper(genenames)
+  #annotate gene names to entrez_id
+  ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+  
+  entrez_names = getBM(attributes = c('external_gene_name', 'entrezgene_id'), 
+                       filters = 'external_gene_name',
+                       values = genenames, mart = ensembl)
+  
+  genelist = data.frame('external_gene_name' = genes$GeneID, 
+                        'foldchange' = genes$avg_log2FC)
+  
+  genelist = merge(genelist, entrez_names, by = 'external_gene_name')
+  genelist = genelist[!is.na(genelist$entrezgene_id),]
+  kegg_genes = genelist[,2]
+  names(kegg_genes) = as.character(genelist[,3])
+  return(kegg_genes)
+}
+
+genelist <- lapply(topTables_macro_0hr, function(x){
+  out <- ref.genelist(x)
+})
+
+genelist2 <- ref.genelist(topTables_DE_pos_neg_4hrs$Macrophage)
+genelist3 <- ref.genelist(topTables_DE_pos_neg_0hrs$Macrophage)
+
+pathview(gene.data  = genelist$`AM 5`, pathway.id = "hsa04668", species = "human",limit = list(gene=1, cpd=1))
+
+pathview(gene.data  = genelist2, pathway.id = "hsa04668", species = "human",limit = list(gene=1, cpd=1))
+pathview(gene.data  = genelist3, pathway.id = "hsa04668", species = "human",limit = list(gene=1, cpd=1))
+```
+
+#tcell
+```{r}
+tcell <- subset(balVer2, subset = label.main == "T cells")
+
+#redo normalizations and clustering 
+tcell <- FindVariableFeatures(tcell, verbose = F)
+tcell <- ScaleData(tcell, verbose = F)
+tcell <- NormalizeData(tcell,  verbose = F)
+tcell <- RunPCA(tcell, verbose = F, npcs = 20)
+#ElbowPlot(tcell)
+tcell <- RunUMAP(tcell, dims = 1:15, verbose = F)
+tcell <- FindNeighbors(tcell, dims = 1:15)
+tcell <- FindClusters(tcell, resolution = 0.5)
+
+topmarkersPercluster <- lapply(unique(tcell$seurat_clusters), function(x){
+  message(paste("running cluster:", x, sep = ""))
+  cluster_marker <- FindMarkers(tcell, ident.1 = x, min.pct = 0.25, only.pos = T)
+  cluster_marker <- cluster_marker %>% rownames_to_column("GeneID")
+})
+names(topmarkersPercluster) <- unique(tcell$seurat_clusters)
+
+#top markers per cluster
+goi <- bind_rows(topmarkersPercluster, .id = "cluster") %>%
+  mutate(cluster = as.numeric(cluster)) %>% 
+  arrange(cluster) %>%
+  group_by(cluster) %>%
+  top_n(40, avg_log2FC)
+
+DoHeatmap(tcell, features = goi$GeneID) + NoLegend()
+ggsave("Figures/Iter3/dump/tcell_seurat_cluster_heatmap.pdf", width = 15, height = 40, units = "in")
+
+DimPlot(tcell, group.by = "seurat_clusters", label = T) + NoLegend() 
+ggsave("Figures/Iter3/dump/dimplot_seurat_clusters_tcell.pdf", width = 8, height = 8, units = "in")
+
+#label tcell subsets
+label.subset <- tcell@meta.data %>%
+  select(seurat_clusters) %>%
+  mutate(label.subset = ifelse(seurat_clusters %in% c(0,4,8), "CD4+ T Act 1", ifelse(seurat_clusters == 1, "CD4+ T Act 2", ifelse(seurat_clusters %in% c(6, 12), "CD4+ T Act 3", ifelse(seurat_clusters == 2, "CD8+ T Act 1", ifelse(seurat_clusters == 3, "CD8+ T Act 2", ifelse(seurat_clusters == 5, "CD4+ EM", ifelse(seurat_clusters %in% c(7,10), "Treg", ifelse(seurat_clusters == 9, "Act T cell", "TC1"))))))))) %>%
+  select(label.subset)
+label.subset$label.subset <- factor(label.subset$label.subset, 
+                                    levels = unique(label.subset$label.subset)[c(2, 5, 6, 1, 3, 7, 9, 4, 8)])
+
+tcell <- AddMetaData(tcell, metadata = label.subset)
+
+markers <- c("CD3D", "CD4","CD8A","CD8B","CCR7", "SELL", "CD44","TNFRSF4", "RORA", "GZMB", "GZMA", "CD69", "ITGAE", "CTLA4", "FOXP3", "IKZF2", "CD40LG", "STAT1", "TNF", "IFNG", "IL2", "GATA3", "HLA-DRA", "HLA-DRB1")
+
+DotPlot(tcell, features = markers, group.by = "label.subset", scale = F) +
+  xlab("") + ylab("") +
+  scale_color_gradient(high = "red", low = "blue") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+ggsave("Figures/Iter3/annotation/tcell/dotplot_tcellsubsets.pdf", width = 10, height = 4.5, units = "in")
+
+DimPlot(tcell, group.by = "label.subset", cols = cols) + theme(plot.title = element_blank())
+
+ggsave("Figures/Iter3/UMAP/tcell/combined_tcell_subsets.pdf", width = 6, height = 5, units = "in")
+
+DoHeatmap(tcell, features = goi$GeneID, group.by = "label.subset", group.colors = cols, label = F) + NoLegend() + theme(axis.text.y = element_blank())
+ggsave("Figures/Iter3/heatmap/tcell/tcell_subsets_noname.png", width = 25, height = 10, units = "in")
+
+plotdat <- SplitObject(tcell, split.by = "hiv_timepoint")
+
+lapply(seq_along(plotdat), function(i){
+  x <- plotdat[[i]]
+  DimPlot(x, reduction = "umap", group.by = "label.subset", cols = cols, label = F, label.size = 3, pt.size = 1.2) + theme(legend.position = "none", plot.title = element_blank())
+  filename <- paste("Figures/Iter3/UMAP/tcell/umap2_", names(plotdat)[i], ".pdf", sep = "") 
+  ggsave(filename, width = 4.5, height = 4, units = "in")
+  return(NULL)
+})
+rm(plotdat)
+
+plan('multisession')
+topTables_tcell = sapply(c("CD4+ EM","CD4+ T Act 1", "CD8+ T Act 1", "Treg", "CD4+ T Act 2", "CD4+ T Act 3", "CD8+ T Act 2", "Act T cell", "Treg"), 
+                         simplify = F, 
+                         USE.NAMES = T, function(x){
+                           print(x)
+                           subs <- subset(tcell,  
+                                          subset = label.subset ==  x)
+                           Idents(subs) <- "hiv_timepoint"
+                           subs <- subset(subs, subset = hiv_timepoint %in% c("POS 4hrs", "NEG 4hrs"))
+                           df <- FindMarkers(subs, ident.1 = "POS 4hrs", 
+                                             ident.2 = "NEG 4hrs",
+                                             only.pos = F)
+                           df <- rownames_to_column(df, var = 'GeneID')
+                           return(df)
+                         })
+
+##gsea
+
+filtered_gene_sets <- all_gene_sets[which(gene_subcats %in% c("HALLMARK", "REACTOME", "KEGG")),]
+
+msigdbr_list = split(x = filtered_gene_sets$gene_symbol, f = filtered_gene_sets$gs_name)
+
+fgsea_genelist = lapply(seq_along(topTables_tcell), function(i){
+  x = topTables_tcell[[i]]
+  print(names(topTables_tcell)[i])
+  preranked = x %>%
+    mutate_at(2,~replace(., . == 0, min(.[.>0], na.rm = TRUE)*0.1)) %>%
+    mutate(logp = -log10(p_val) * sign(avg_log2FC)) %>%
+    #filter(!grepl('Mt-', GeneID)) %>%
+    arrange(logp)
+  rankset = setNames(preranked$logp, preranked$GeneID)
+  fgsea_out = fgsea(pathways = msigdbr_list, stats = rankset)
+  fgsea_out$leadingEdge = sapply(fgsea_out$leadingEdge, function(x){
+    x = paste(x, collapse = ',')
+  })
+  fgsea_out = fgsea_out[order(fgsea_out$padj),]
+  return(fgsea_out)
+})
+names(fgsea_genelist) = names(topTables_tcell)
+write_xlsx(fgsea_genelist, 'fgsea_reactome_Lung9s2_label_main_01222023.xlsx')
+
+gsea_reactome = lapply(fgsea_genelist, function(x){
+  x = x[x$pval <= 0.05,]
+  new_pathway = sapply(strsplit(x$pathway, split = '_'), function(y){
+    y = y[-1]
+    out = paste(y, collapse = ' ')
+  })
+  x$pathway2 = new_pathway
+  x = x[order(x$NES, decreasing = T),]
+})
+
+#combine cell types
+combined_fgsea = lapply(gsea_reactome, function(x){
+  xlist = x[order(x$NES, decreasing = T),]
+  xlist$pathway3 = gsub('_', ' ', xlist$pathway)
+  xlist$pathway3 = str_wrap(xlist$pathway3, 50)
+  xlist$pathway3 = factor(xlist$pathway3, levels = rev(unique(xlist$pathway3)))
+  xlist$status = cut(xlist$NES, breaks = c(-Inf, 0, Inf), 
+                     labels  = c('Down-reg', 'Up-reg'))
+  return(xlist)
+})
+
+combined_fgsea <- combined_fgsea[sapply(combined_fgsea, nrow) > 0]
+combined_fgsea = bind_rows(combined_fgsea, .id = 'cell_type')
+
+combined_fgsea$pathway3 = str_to_sentence(combined_fgsea$pathway3)
+
+plotdat <- combined_fgsea
+#keep pathways of interest
+poi <- c("Hallmark tnfa signaling via nfkb", "Hallmark interferon gamma response", "Hallmark interferon alpha response", "Reactome interleukin 4 and interleukin 13\nSignaling", "Reactome interleukin 2 signaling", "Reactome interleukin 10 signaling", "Reactome interleukin 1 signaling", "Reactome cytokine signaling in immune system", "Reactome adaptive immune system", "Kegg toll like receptor signaling pathway", "Kegg rig i like receptor signaling pathway", "Kegg cytokine cytokine receptor interaction", "Kegg chemokine signaling pathway", "Kegg cell adhesion molecules cams")
+plotdat <- plotdat[plotdat$pathway3 %in% poi,]
+
+
+ggplot(plotdat, aes(x = cell_type, y = pathway3, color = NES)) +
+    geom_point(aes(size = size)) +
+    xlab("") +
+    theme_Publication() + 
+    scale_color_gradient2(low = '#2166ac', high = '#b2182b') +
+    #scale_size(range = c(1, 12), breaks = c(0, 30, 60, 90, 120, 150)) +
+    scale_size(range = c(1, 12), breaks = c(0, 25, 50, 100, 150, 200)) +
+    theme(axis.text.x = element_text(size = 10, angle = 90, vjust = 0.5, hjust = 1),
+          axis.text.y = element_text(size = 10),
+          axis.title.y = element_blank(),
+          plot.title = element_text(size = 12, face = 'bold', hjust = 0.5,
+                                    vjust = 1),
+          legend.position = 'right',
+          legend.direction = 'vertical')
+
+ggsave("Figures/Iter3/GSEA/tcell/tcell_bubble_combined2.pdf", width = 8, height = 7, units = "in")
+```
+
+#global FGSEA
+```{r}
+##gsea
+
+filtered_gene_sets <- all_gene_sets[which(gene_subcats %in% "HALLMARK"),]
+filtered_gene_sets <- all_gene_sets[which(gene_subcats %in% "REACTOME"),]
+
+msigdbr_list = split(x = filtered_gene_sets$gene_symbol, f = filtered_gene_sets$gs_name)
+
+fgsea_genelist = lapply(seq_along(topTables_DE_pos_neg_4hrs), function(i){
+  x = topTables_DE_pos_neg_4hrs[[i]]
+  print(names(topTables_DE_pos_neg_4hrs)[i])
+  preranked = x %>%
+    mutate_at(2,~replace(., . == 0, min(.[.>0], na.rm = TRUE)*0.1)) %>%
+    mutate(logp = -log10(p_val) * sign(avg_log2FC)) %>%
+    #filter(!grepl('Mt-', GeneID)) %>%
+    arrange(logp)
+  rankset = setNames(preranked$logp, preranked$GeneID)
+  fgsea_out = fgsea(pathways = msigdbr_list, stats = rankset)
+  fgsea_out$leadingEdge = sapply(fgsea_out$leadingEdge, function(x){
+    x = paste(x, collapse = ',')
+  })
+  fgsea_out = fgsea_out[order(fgsea_out$padj),]
+  return(fgsea_out)
+})
+names(fgsea_genelist) = names(topTables_DE_pos_neg_4hrs)
+#write_xlsx(fgsea_genelist, 'fgsea_reactome_Lung9s2_label_main_01222023.xlsx')
+
+gsea_reactome = lapply(fgsea_genelist, function(x){
+  x = x[x$pval <= 0.05,]
+  new_pathway = sapply(strsplit(x$pathway, split = '_'), function(y){
+    y = y[-1]
+    out = paste(y, collapse = ' ')
+  })
+  x$pathway2 = new_pathway
+  x = x[order(x$NES, decreasing = T),]
+})
+
+#combine cell types
+combined_fgsea = lapply(gsea_reactome, function(x){
+  xlist = x[order(x$NES, decreasing = T),]
+  xlist$pathway3 = gsub('_', ' ', xlist$pathway)
+  #x$pathway3 = str_to_sentence(x$pathway3)
+  xlist$pathway3 = str_wrap(xlist$pathway3, 40)
+  xlist$pathway3 = factor(xlist$pathway3, levels = rev(unique(xlist$pathway3)))
+  xlist$status = cut(xlist$NES, breaks = c(-Inf, 0, Inf), 
+                     labels  = c('Down-reg', 'Up-reg'))
+  return(xlist)
+})
+
+combined_fgsea = bind_rows(combined_fgsea, .id = 'cell_type')
+
+#keep only duplicated entries
+combined_fgsea = combined_fgsea[combined_fgsea$pathway %in% combined_fgsea$pathway[duplicated(combined_fgsea$pathway)],]
+
+
+#keep pathways of interest
+#mitochondrial, atp, interleukin, cytokines, chemokines, tca, ETC, innate, adaptive
+plotdat_hallmark <- combined_fgsea
+plotdat_reactome = combined_fgsea[grep("mitochond|ATP|interleukin|cytokine|chemokine|TCA|electron|innate|adaptive", combined_fgsea$pathway3, ignore.case = T),]
+plotdat <- rbind(plotdat_hallmark, plotdat_reactome)
+plotdat <- plotdat[plotdat$pathway %in% c("HALLMARK_TNFA_SIGNALING_VIA_NFKB", "HALLMARK_INTERFERON_GAMMA_RESPONSE", "HALLMARK_INTERFERON_ALPHA_RESPONSE", "HALLMARK_OXIDATIVE_PHOSPHORYLATION", "HALLMARK_INFLAMMATORY_RESPONSE" , "REACTOME_INTERLEUKIN_10_SIGNALING", "REACTOME_INTERLEUKIN_4_AND_INTERLEUKIN_13_SIGNALING", "REACTOME_SIGNALING_BY_INTERLEUKINS" , "REACTOME_CYTOKINE_SIGNALING_IN_IMMUNE_SYSTEM", "REACTOME_THE_CITRIC_ACID_TCA_CYCLE_AND_RESPIRATORY_ELECTRON_TRANSPORT", "REACTOME_RESPIRATORY_ELECTRON_TRANSPORT"),]
+
+ggplot(plotdat, aes(x = cell_type, y = pathway3, color = NES)) +
+    geom_point(aes(size = size)) +
+    xlab("") +
+    theme_Publication() + 
+    scale_color_gradient2(low = '#2166ac', high = '#b2182b') +
+    scale_size(range = c(1, 12), breaks = c(0, 50, 100, 200, 400, 600, 800)) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 12),
+          axis.text.y = element_text(size = 12),
+          axis.title.y = element_blank(),
+          plot.title = element_text(size = 12, face = 'bold', hjust = 0.5,
+                                    vjust = 1),
+          legend.position = 'right',
+          legend.direction = 'vertical')
+ggsave('Figures/Iter3/GSEA/all_celltypes_combined.pdf', width = 9, height = 7, units = 'in')
+```
+
+#violin plot pseudobulk
+```{r}
+gene_voilin_pos_neg_4hrs_bulk("IL6", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Bulk all cells/IL6.png", width = 5, height = 4, units = "in")
+
+gene_voilin_pos_neg_4hrs_bulk("TNF", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Bulk all cells/Tnf.png", width = 5, height = 4, units = "in")
+
+gene_voilin_pos_neg_4hrs_bulk_cd45("IL6", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Bulk CD45/IL6.png", width = 5, height = 4, units = "in")
+
+gene_voilin_pos_neg_4hrs_bulk_cd45("TNF", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Bulk CD45/Tnf.png", width = 5, height = 4, units = "in")
+```
+
+#voilin plot of genes of interest
+```{r}
+gene_voilin_pos_neg_4hrs("NLRP3", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/nlrp3.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs("IL1A", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Il1a.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs("IL1B", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Il1b.png", width = 12, height = 12, units = "in")
+
+gene_voilin_pos_neg_4hrs("IL18", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Il18.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs("IL6", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Il6.png", width = 12, height = 4, units = "in")
+
+gene_voilin_pos_neg_4hrs("IL12A", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Il12a.png", width = 3, height = 3.2, units = "in")
+
+gene_voilin_pos_neg_4hrs("TNF", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Tnf.png", width = 12, height = 12, units = "in")
+
+gene_voilin_pos_neg_4hrs("IL4", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Il4.png", width = 6, height = 3.2, units = "in")
+
+gene_voilin_pos_neg_4hrs("IL10", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/IL10.png", width = 12, height = 4, units = "in")
+
+gene_voilin_pos_neg_4hrs("TGFB1", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Tgfb1.png", width = 12, height = 12, units = "in")
+
+gene_voilin_pos_neg_4hrs("IL1R1", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Il1r1.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs("IL13", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Il1r1.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs("IL23A", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Il23a.png", width = 8, height = 4, units = "in")
+
+gene_voilin_pos_neg_4hrs("IL17B", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Il23a.png", width = 8, height = 4, units = "in")
+
+gene_voilin_pos_neg_4hrs("IFNG", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Ifng.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs("IFNA1", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Ifna1.png", width = 4, height = 4, units = "in")
+
+gene_voilin_pos_neg_4hrs("IFNB1", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Ifnb1.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs("IFNW1", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Ifnw1.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs("HMOX1", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Hmox1.png", width = 12, height = 12, units = "in")
+
+gene_voilin_pos_neg_4hrs("GCLM", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Gclm.png", width = 12, height = 12, units = "in")
+
+gene_voilin_pos_neg_4hrs("GSTM1", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Gstm1.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs("SLC7A11", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Slc7a11.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs("NFE2L2", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/Nrf2.png", width = 12, height = 12, units = "in")
+
+gene_voilin_pos_neg_4hrs("CD300A", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/CD300a.png", width = 12, height = 12, units = "in")
+
+gene_voilin_pos_neg_4hrs("PIEZO1", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/CD300a.png", width = 12, height = 12, units = "in")
+
+gene_voilin_pos_neg_4hrs("TRPV4", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/CD300a.png", width = 12, height = 12, units = "in")
+
+gene_voilin_pos_neg_4hrs("HLA-DRA", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/HLA-DRA.png", width = 16, height = 12, units = "in")
+
+gene_voilin_pos_neg_4hrs("HLA-DRB1", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/HLA-DRB1.png", width = 16, height = 12, units = "in")
+
+gene_voilin_pos_neg_4hrs("HLA-DQA1", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/HLA-DQA1.png", width = 16, height = 12, units = "in")
+
+gene_voilin_pos_neg_4hrs("HLA-DQB1", seurat_obj = balVer2)
+ggsave("Figures/Iter3/Voilin/HLA-DQB1.png", width = 16, height = 12, units = "in")
+```
+
+#voilin plot of genes of interest for macrophage cluster
+```{r}
+gene_voilin_pos_neg_4hrs_macro("NLRP3", seurat_obj = am)
+ggsave("Figures/Iter3/Voilin/AM clusters/nlrp3.png", width = 12, height = 4, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("IL1A", seurat_obj = am)
+ggsave("Figures/Iter3/Voilin/AM clusters/Il1a.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("IL1B", seurat_obj = am)
+ggsave("Figures/Iter3/Voilin/AM clusters/Il1b.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("IL18", seurat_obj = am)
+ggsave("Figures/Iter3/Voilin/AM clusters/Il18.png", width = 8, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("IL6", seurat_obj = am)
+ggsave("Figures/Iter3/Voilin/AM clusters/Il6.png", width = 8, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("IL12A", seurat_obj = am)#not enough expression
+ggsave("Figures/Iter3/Voilin/Il12a.png", width = 3, height = 3.2, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("TNF", seurat_obj = am)
+ggsave("Figures/Iter3/Voilin/AM clusters/Tnf.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("IL4", seurat_obj = am)#not enough expression
+ggsave("Figures/Iter3/Voilin/Il4.png", width = 6, height = 3.2, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("IL10", seurat_obj = am)
+ggsave("Figures/Iter3/Voilin/AM clusters/IL10.png", width = 8, height = 4, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("TGFB1", seurat_obj = am)
+ggsave("Figures/Iter3/Voilin/AM clusters/Tgfb1.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("IL1R1", seurat_obj = am)
+ggsave("Figures/Iter3/Voilin/AM clusters/Il1r1.png", width = 12, height = 4, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("IL13", seurat_obj = am)#not enough expression
+ggsave("Figures/Iter3/Voilin/Il1r1.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("IL23A", seurat_obj = am)
+ggsave("Figures/Iter3/Voilin/AM clusters/Il23a.png", width = 12, height = 4, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("IFNG", seurat_obj = am)#not enough expression
+ggsave("Figures/Iter3/Voilin/Ifng.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("IFNA1", seurat_obj = am)
+ggsave("Figures/Iter3/Voilin/AM clusters/Ifna1.png", width = 4, height = 4, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("IFNB1", seurat_obj = am)#not enough expression
+ggsave("Figures/Iter3/Voilin/Ifnb1.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("IFNW1", seurat_obj = am)#not enough expression
+ggsave("Figures/Iter3/Voilin/Ifnw1.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("HMOX1", seurat_obj = macro)
+ggsave("Figures/Iter3/Voilin/Hmox1.png", width = 12, height = 12, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("GCLM", seurat_obj = macro)
+ggsave("Figures/Iter3/Voilin/Gclm.png", width = 12, height = 12, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("GSTM1", seurat_obj = macro)
+ggsave("Figures/Iter3/Voilin/Gstm1.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("SLC7A11", seurat_obj = macro)
+ggsave("Figures/Iter3/Voilin/Slc7a11.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("NFE2L2", seurat_obj = macro)
+ggsave("Figures/Iter3/Voilin/Nrf2.png", width = 12, height = 12, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("CD300A", seurat_obj = macro)
+ggsave("Figures/Iter3/Voilin/CD300a.png", width = 12, height = 12, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("PIEZO1", seurat_obj = macro)
+ggsave("Figures/Iter3/Voilin/CD300a.png", width = 12, height = 12, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("TRPV4", seurat_obj = macro)
+ggsave("Figures/Iter3/Voilin/CD300a.png", width = 12, height = 12, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("HLA-DRA", seurat_obj = am)
+ggsave("Figures/Iter3/Voilin/AM clusters/HLA-DRA.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("HLA-DRB1", seurat_obj = am)
+ggsave("Figures/Iter3/Voilin/AM clusters/HLA-DRB1.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("HLA-DQA1", seurat_obj = am)
+ggsave("Figures/Iter3/Voilin/AM clusters/HLA-DQA1.png", width = 12, height = 8, units = "in")
+
+gene_voilin_pos_neg_4hrs_macro("HLA-DQB1", seurat_obj = am)
+ggsave("Figures/Iter3/Voilin/AM clusters/HLA-DQB1.png", width = 12, height = 8, units = "in")
+```
+
+
+
+# DEG analysis for 4hrs vs 0hrs HIV-
+```{r}
+rm(list = ls())
+balVer2 <- readRDS("rds_data/balver2.rds")
+balVer2$label.main2 <- factor(balVer2$label.main2, levels = c("AM", "MDM", "Neutrophils", "DC", "Monocyte", "CD4 T cell", "CD8 T cell", "Tgd", "T reg", "B cell", "NK cell", "Epithelial cells"))
+cols <- c("#386cb0","#fdb462","#7fc97f","#ef3b2c","#662506","#a6cee3",
+         "#fb9a99","#6A3D9A","#F6DF07", "#F0027F","#BF5B17", "#666666",
+         "#33A02C", "#FF7F00", "#E78AC3")
+#balVer2$hiv_timepoint <- gsub("NEG", "HIV(-)", balVer2$hiv_timepoint)
+#balVer2$hiv_timepoint <- gsub("POS", "HIV(+)", balVer2$hiv_timepoint)
+#balVer2$hiv_timepoint <- factor(balVer2$hiv_timepoint, levels = c("HIV(-) 0hrs", "HIV(+) 0hrs", "HIV(-) 4hrs", "HIV(+) 4hrs"))
+
+plan("multiprocess", workers = 8)
+topTables_DE_neg_4hr_vs_0hr = sapply(unique(balVer2$label.main2), 
+                         simplify = F, 
+                         USE.NAMES = T, function(x){
+                           print(x)
+                           subs <- subset(balVer2,  
+                                          subset = label.main2 ==  x) 
+                           Idents(subs) <- subs@meta.data$hiv_timepoint
+                           subs <- subset(subs, subset = hiv_timepoint %in% c("NEG 4hrs", "NEG 0hrs"))
+                           print(unique(subs@meta.data$hiv_timepoint))
+                           
+                           df <- FindMarkers(subs, ident.1 = "NEG 4hrs", ident.2 = "NEG 0hrs", 
+                                             test.use = 'MAST',
+                                             only.pos = F,
+                                             min.pct = 0,
+                                             logfc.threshold = 0)
+                           df <- rownames_to_column(df, var = 'GeneID')
+                           return(df)
+                         })
+
+names(topTables_DE_neg_4hr_vs_0hr) <- unique(balVer2$label.main2)
+saveRDS(topTables_DE_neg_4hr_vs_0hr, "rds_data/topTables_DE_neg_4hrs_vs_0hrs.rds")
+```
+
+# DEG analysis for 4hrs vs 0hrs HIV+
+```{r}
+rm(list = ls())
+balVer2 <- readRDS("rds_data/balver2.rds")
+balVer2$label.main2 <- factor(balVer2$label.main2, levels = c("AM", "MDM", "Neutrophils", "DC", "Monocyte", "CD4 T cell", "CD8 T cell", "Tgd", "T reg", "B cell", "NK cell", "Epithelial cells"))
+cols <- c("#386cb0","#fdb462","#7fc97f","#ef3b2c","#662506","#a6cee3",
+         "#fb9a99","#6A3D9A","#F6DF07", "#F0027F","#BF5B17", "#666666",
+         "#33A02C", "#FF7F00", "#E78AC3")
+
+#remove cells with less that 3 cells
+FreqTable <- data.frame("label.main2" = balVer2$label.main2, "HIV_timepoint" = balVer2$hiv_timepoint) %>% 
+  group_by(HIV_timepoint, label.main2) %>% 
+  summarise(n_cells = n()) %>% 
+  ungroup() %>% 
+  spread(label.main2, n_cells, fill = 0)
+#remove neutrophils since number per group is very less
+
+celltypes <- as.character(unique(balVer2$label.main2))
+celltypes <- celltypes[celltypes != "Neutrophils"]
+plan("multiprocess", workers = 8)
+topTables_DE_pos_4hr_vs_0hr = sapply(celltypes, 
+                         simplify = F, 
+                         USE.NAMES = T, function(x){
+                           print(x)
+                           subs <- subset(balVer2,  
+                                          subset = label.main2 ==  x) 
+                           Idents(subs) <- subs@meta.data$hiv_timepoint
+                           subs <- subset(subs, subset = hiv_timepoint %in% c("POS 4hrs", "POS 0hrs"))
+                           print(unique(subs@meta.data$hiv_timepoint))
+                           
+                           df <- FindMarkers(subs, ident.1 = "POS 4hrs", ident.2 = "POS 0hrs", 
+                                             test.use = 'MAST',
+                                             only.pos = F,
+                                             min.pct = 0,
+                                             logfc.threshold = 0)
+                           df <- rownames_to_column(df, var = 'GeneID')
+                           return(df)
+                         })
+
+#names(topTables_DE_pos_4hr_vs_0hr) <- celltypes
+saveRDS(topTables_DE_pos_4hr_vs_0hr, "rds_data/topTables_DE_pos_4hr_vs_0hr.rds")
+```
+
+# DEG analysis for HIV+ 0hrs vs HIV- 0hrs
+```{r}
+rm(list = ls())
+balVer2 <- readRDS("rds_data/balver2.rds")
+balVer2$label.main2 <- factor(balVer2$label.main2, levels = c("AM", "MDM", "Neutrophils", "DC", "Monocyte", "CD4 T cell", "CD8 T cell", "Tgd", "T reg", "B cell", "NK cell", "Epithelial cells"))
+cols <- c("#386cb0","#fdb462","#7fc97f","#ef3b2c","#662506","#a6cee3",
+         "#fb9a99","#6A3D9A","#F6DF07", "#F0027F","#BF5B17", "#666666",
+         "#33A02C", "#FF7F00", "#E78AC3")
+
+#remove cells with less that 3 cells
+FreqTable <- data.frame("label.main2" = balVer2$label.main2, "HIV_timepoint" = balVer2$hiv_timepoint) %>% 
+  group_by(HIV_timepoint, label.main2) %>% 
+  summarise(n_cells = n()) %>% 
+  ungroup() %>% 
+  spread(label.main2, n_cells, fill = 0)
+#remove neutrophils since number per group is very less
+
+celltypes <- as.character(unique(balVer2$label.main2))
+celltypes <- celltypes[celltypes != "Neutrophils"]
+plan("multiprocess", workers = 8)
+topTables_DE_pos_neg_0hr = sapply(celltypes, 
+                         simplify = F, 
+                         USE.NAMES = T, function(x){
+                           print(x)
+                           subs <- subset(balVer2,  
+                                          subset = label.main2 ==  x) 
+                           Idents(subs) <- subs@meta.data$hiv_timepoint
+                           subs <- subset(subs, subset = hiv_timepoint %in% c("POS 0hrs", "NEG 0hrs"))
+                           print(unique(subs@meta.data$hiv_timepoint))
+                           
+                           df <- FindMarkers(subs, ident.1 = "POS 0hrs", ident.2 = "NEG 0hrs", 
+                                             test.use = 'MAST',
+                                             only.pos = F,
+                                             min.pct = 0,
+                                             logfc.threshold = 0)
+                           df <- rownames_to_column(df, var = 'GeneID')
+                           return(df)
+                         })
+
+#names(topTables_DE_pos_4hr_vs_0hr) <- celltypes
+saveRDS(topTables_DE_pos_neg_0hr, "rds_data/topTables_DE_pos_neg_0hr_label_main2.rds")
+```
+
+# DEG analysis for HIV+ 4hrs vs HIV- 4hrs
+```{r}
+rm(list = ls())
+balVer2 <- readRDS("rds_data/balver2.rds")
+balVer2$label.main2 <- factor(balVer2$label.main2, levels = c("AM", "MDM", "Neutrophils", "DC", "Monocyte", "CD4 T cell", "CD8 T cell", "Tgd", "T reg", "B cell", "NK cell", "Epithelial cells"))
+cols <- c("#386cb0","#fdb462","#7fc97f","#ef3b2c","#662506","#a6cee3",
+         "#fb9a99","#6A3D9A","#F6DF07", "#F0027F","#BF5B17", "#666666",
+         "#33A02C", "#FF7F00", "#E78AC3")
+
+#remove cells with less that 3 cells
+FreqTable <- data.frame("label.main2" = balVer2$label.main2, "HIV_timepoint" = balVer2$hiv_timepoint) %>% 
+  group_by(HIV_timepoint, label.main2) %>% 
+  summarise(n_cells = n()) %>% 
+  ungroup() %>% 
+  spread(label.main2, n_cells, fill = 0)
+#remove neutrophils since number per group is very less
+
+celltypes <- as.character(unique(balVer2$label.main2))
+celltypes <- celltypes[celltypes != "Neutrophils"]
+plan("multiprocess", workers = 8)
+topTables_DE_pos_neg_4hr = sapply(celltypes, 
+                         simplify = F, 
+                         USE.NAMES = T, function(x){
+                           print(x)
+                           subs <- subset(balVer2,  
+                                          subset = label.main2 ==  x) 
+                           Idents(subs) <- subs@meta.data$hiv_timepoint
+                           subs <- subset(subs, subset = hiv_timepoint %in% c("POS 4hrs", "NEG 4hrs"))
+                           print(unique(subs@meta.data$hiv_timepoint))
+                           
+                           df <- FindMarkers(subs, ident.1 = "POS 4hrs", ident.2 = "NEG 4hrs", 
+                                             test.use = 'MAST',
+                                             only.pos = F,
+                                             min.pct = 0,
+                                             logfc.threshold = 0)
+                           df <- rownames_to_column(df, var = 'GeneID')
+                           return(df)
+                         })
+
+#names(topTables_DE_pos_4hr_vs_0hr) <- celltypes
+saveRDS(topTables_DE_pos_neg_4hr, "rds_data/topTables_DE_pos_neg_4hr_label_main2.rds")
+```
+
+```{r}
+balVer2 <- readRDS("rds_data/balver2.rds")
+Idents(balVer2) <- "hiv_timepoint"
+plan('multisession')
+topTables_hivneg_4h_vs_0hr_global <- FindMarkers(balVer2, ident.1 = "NEG 4hrs", ident.2 = "NEG 0hrs", test.use = 'MAST', only.pos = F, min.pct = 0, logfc.threshold = 0)
+saveRDS(topTables_hivneg_4h_vs_0hr_global, "rds_data/topTables_hivneg_4h_vs_0hr_global.rds")
+```
+
+```{r}
+plan('multisession')
+topTables_hivpos_4h_vs_0hr_global <- FindMarkers(balVer2, ident.1 = "POS 4hrs", ident.2 = "POS 0hrs", test.use = 'MAST', only.pos = F, min.pct = 0, logfc.threshold = 0)
+saveRDS(topTables_hivpos_4h_vs_0hr_global, "rds_data/topTables_hivpos_4h_vs_0hr_global.rds")
+```
+
